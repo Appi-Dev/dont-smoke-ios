@@ -11,11 +11,16 @@ struct DontSmokeApp: App {
 
 struct RootView: View {
     @Query private var profiles: [QuitProfile]
+    @AppStorage(ProductWalkthroughPreferences.seenKey) private var hasSeenProductWalkthrough = false
 
     var body: some View {
         Group {
             if let profile = profiles.first(where: \.onboardingCompleted) {
-                MainTabView(profile: profile)
+                if ProductWalkthroughPreferences.shouldPresent(onboardingCompleted: profile.onboardingCompleted, hasSeen: hasSeenProductWalkthrough) {
+                    ProductWalkthroughView(profile: profile) { hasSeenProductWalkthrough = true }
+                } else {
+                    MainTabView(profile: profile)
+                }
             } else {
                 OnboardingFlowView()
             }

@@ -109,6 +109,7 @@ private struct MeView: View {
     @AppStorage("showMyWhyOnToday") private var showMyWhyOnToday = true
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var photoError: String?
+    @State private var showAppTour = false
     var body: some View {
         NavigationStack { Form {
             Section("My Why") {
@@ -130,8 +131,14 @@ private struct MeView: View {
                 }
             }
             Section("Preferences") { Toggle("Notifications", isOn: $notificationsEnabled); LabeledContent("Appearance", value: "Dark") }
+            Section {
+                Button("Replay App Tour") { showAppTour = true }
+            }
         }.scrollContentBackground(.hidden).background(AppColor.background).navigationTitle("Me")
             .onChange(of: selectedPhoto) { _, item in Task { await importPhoto(item) } }
+            .fullScreenCover(isPresented: $showAppTour) {
+                ProductWalkthroughView(profile: profile, isReplay: true) { showAppTour = false }
+            }
         }
     }
 
