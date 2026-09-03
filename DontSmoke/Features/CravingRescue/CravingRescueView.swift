@@ -27,7 +27,7 @@ struct CravingRescueView: View {
                         case .breathing, .continuedBreathing, .extended: breathingContent
                         case .checkIn: checkInContent
                         case .myWhy: whyContent
-                        case .settling, .completed: completionContent
+                        case .completed: completionContent
                         }
                     }
                     .frame(maxWidth: .infinity, minHeight: 610)
@@ -81,10 +81,12 @@ struct CravingRescueView: View {
                 Button(session.isMuted ? "Turn Sound On" : "Mute") { session.toggleMute() }
             }
         } label: {
-            Image(systemName: session.isMuted || session.selectedSound == .silence ? "speaker.slash" : "speaker.wave.2")
-                .frame(width: 44, height: 44)
+            Label(soundLabel, systemImage: session.isMuted || session.selectedSound == .silence ? "speaker.slash" : "speaker.wave.2")
+                .font(.caption)
+                .padding(.horizontal, 12)
+                .frame(minHeight: 44)
                 .foregroundStyle(AppColor.sage)
-                .background(AppColor.surface, in: Circle())
+                .background(AppColor.surface, in: Capsule())
         }
         .accessibilityLabel("Ambient sound")
         .accessibilityValue(soundAccessibilityValue)
@@ -184,7 +186,7 @@ struct CravingRescueView: View {
                 .foregroundStyle(AppColor.secondaryText)
                 .multilineTextAlignment(.center)
             Spacer()
-            PrimaryButton(title: session.access.sessionDuration > RescueSession.checkInTime ? "Keep breathing" : "Continue") {
+            PrimaryButton(title: "Keep breathing") {
                 session.continueAfterWhy()
             }
         }
@@ -216,16 +218,19 @@ struct CravingRescueView: View {
     }
 
     private var completionTitle: String {
-        if session.phase == .settling { return "Let your breathing settle." }
         if session.extensionUsed { return "You stayed with it a little longer." }
-        return session.access.canExtend
-            ? "You made it through these five minutes."
-            : "You made it through these two minutes."
+        return "You made it through these five minutes."
+    }
+
+    private var soundLabel: String {
+        let title = session.selectedSound?.title ?? "Silence"
+        let label = session.soundSelection == .random ? "Random · \(title)" : title
+        return session.isMuted && session.selectedSound != .silence ? "\(label) · Muted" : label
     }
 
     private var soundAccessibilityValue: String {
         if session.isMuted || session.selectedSound == .silence { return "Silence" }
-        return session.selectedSound?.title ?? "Silence"
+        return soundLabel
     }
 
     private func updateAudio() {

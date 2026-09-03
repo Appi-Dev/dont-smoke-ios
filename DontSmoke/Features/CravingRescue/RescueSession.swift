@@ -6,7 +6,6 @@ enum RescuePhase: Equatable {
     case checkIn
     case myWhy
     case continuedBreathing
-    case settling
     case completed
     case extended
 }
@@ -35,6 +34,11 @@ enum RescueSoundscape: String, CaseIterable, Identifiable, Codable {
     }
 
     var resourceName: String { rawValue }
+    var resourceFilename: String? { self == .silence ? nil : "\(resourceName).wav" }
+    func resourceURL(in bundle: Bundle = .main) -> URL? {
+        guard self != .silence else { return nil }
+        return bundle.url(forResource: resourceName, withExtension: "wav")
+    }
 }
 
 struct RescueAccess: Equatable {
@@ -43,9 +47,9 @@ struct RescueAccess: Equatable {
     let canExtend: Bool
 
     static let free = RescueAccess(
-        sessionDuration: 120,
-        availableSoundscapes: [.breeze, .silence],
-        canExtend: false
+        sessionDuration: 300,
+        availableSoundscapes: RescueSoundscape.allCases,
+        canExtend: true
     )
 
     static let premium = RescueAccess(
@@ -60,7 +64,7 @@ protocol RescueEntitlementProviding {
 }
 
 struct DefaultRescueEntitlements: RescueEntitlementProviding {
-    // StoreKit can replace this provider later without leaking premium checks into the UI.
+    // Development access is unrestricted. StoreKit restrictions will be added later.
     let rescueAccess = RescueAccess.free
 }
 
@@ -87,13 +91,18 @@ enum RescueSoundSelector {
 struct RescueSession {
     static let groundingDuration: TimeInterval = 20
     static let checkInTime: TimeInterval = 120
-    static let premiumCompletionStart: TimeInterval = 270
     static let extensionDuration: TimeInterval = 300
 
     let access: RescueAccess
     let startDate: Date
     private(set) var now: Date
-    private(set) var phase: RescuePhase = .grounding
+    private(set) var phase: RescuePhase = .grounding {
+        didSet {
+            #if DEBUG
+            if oldValue != phase { print("[Rescue] Phase: \(oldValue) -> \(phase); elapsed: \(Int(elapsed))s") }
+            #endif
+        }
+    }
     private(set) var selectedSound: RescueSoundscape?
     private(set) var soundSelection: RescueSoundSelection = .random
     private(set) var isMuted = false
@@ -114,6 +123,7 @@ struct RescueSession {
             excluding: lastRandomSound,
             randomIndex: randomIndex
         )
+        logRandomSound()
     }
 
     var elapsed: TimeInterval {
@@ -155,18 +165,15 @@ struct RescueSession {
             if extensionElapsed >= Self.extensionDuration { phase = .completed }
             return
         }
-        if phase == .checkIn || phase == .myWhy || phase == .completed { return }
-        if phase == .settling {
-            if elapsed >= access.sessionDuration { phase = .completed }
-            return
-        }
+        if phase == .completed { return }
+        if elapsed >= access.sessionDuration { phase = .completed; return }
+        if phase == .checkIn || phase == .myWhy { return }
         if elapsed < Self.groundingDuration {
             phase = .grounding
         } else if elapsed < Self.checkInTime {
             phase = .breathing
         } else if phase == .continuedBreathing {
             if elapsed >= access.sessionDuration { phase = .completed }
-            else if elapsed >= Self.premiumCompletionStart { phase = .settling }
         } else {
             phase = .checkIn
         }
@@ -203,6 +210,7 @@ struct RescueSession {
                 excluding: selectedSound,
                 randomIndex: randomIndex
             )
+            logRandomSound()
         case .soundscape(let soundscape):
             guard access.availableSoundscapes.contains(soundscape) else { return }
             soundSelection = selection
@@ -216,7 +224,13 @@ struct RescueSession {
     }
 
     private mutating func continueAfterCheckIn() {
-        phase = access.sessionDuration > Self.checkInTime ? .continuedBreathing : .completed
+        phase = elapsed >= access.sessionDuration ? .completed : .continuedBreathing
+    }
+
+    private func logRandomSound() {
+        #if DEBUG
+        print("[Rescue] Random sound selected: \(selectedSound?.title ?? "Silence")")
+        #endif
     }
 }
 

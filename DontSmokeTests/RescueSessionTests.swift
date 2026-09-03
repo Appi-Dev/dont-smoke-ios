@@ -4,9 +4,10 @@ import XCTest
 final class RescueSessionTests: XCTestCase {
     private let start = Date(timeIntervalSince1970: 1_800_000_000)
 
-    func testFreeAndPremiumDurations() {
-        XCTAssertEqual(RescueAccess.free.sessionDuration, 120)
+    func testDevelopmentAccessUsesFiveMinutesWithoutEntitlementRestriction() {
+        XCTAssertEqual(RescueAccess.free.sessionDuration, 300)
         XCTAssertEqual(RescueAccess.premium.sessionDuration, 300)
+        XCTAssertEqual(DefaultRescueEntitlements().rescueAccess, .free)
     }
 
     func testGroundingBreathingAndCheckInTransitionsUseDates() {
@@ -24,12 +25,17 @@ final class RescueSessionTests: XCTestCase {
         XCTAssertEqual(session.elapsed, 120)
     }
 
-    func testFreeCheckInCompletesAfterTwoMinutes() {
+    func testALittleContinuesSameSessionAfterTwoMinutes() {
         var session = RescueSession(access: .free, startDate: start)
         session.update(now: start.addingTimeInterval(120))
         session.answerCheckIn(isEasier: true)
+        XCTAssertEqual(session.phase, .continuedBreathing)
+        XCTAssertEqual(session.startDate, start)
+        XCTAssertEqual(session.elapsed, 120)
+        session.update(now: start.addingTimeInterval(299))
+        XCTAssertEqual(session.phase, .continuedBreathing)
+        session.update(now: start.addingTimeInterval(300))
         XCTAssertEqual(session.phase, .completed)
-        XCTAssertFalse(session.canExtend)
     }
 
     func testNotYetShowsMyWhyBeforeContinuing() {
@@ -37,8 +43,15 @@ final class RescueSessionTests: XCTestCase {
         session.update(now: start.addingTimeInterval(120))
         session.answerCheckIn(isEasier: false)
         XCTAssertEqual(session.phase, .myWhy)
+        session.update(now: start.addingTimeInterval(145))
+        XCTAssertEqual(session.phase, .myWhy)
+        XCTAssertEqual(session.elapsed, 145)
         session.continueAfterWhy()
         XCTAssertEqual(session.phase, .continuedBreathing)
+        XCTAssertEqual(session.startDate, start)
+        XCTAssertEqual(session.elapsed, 145)
+        session.update(now: start.addingTimeInterval(300))
+        XCTAssertEqual(session.phase, .completed)
     }
 
     func testPremiumCompletionAndExtensionFlow() {
@@ -48,7 +61,7 @@ final class RescueSessionTests: XCTestCase {
         session.update(now: start.addingTimeInterval(269))
         XCTAssertEqual(session.phase, .continuedBreathing)
         session.update(now: start.addingTimeInterval(270))
-        XCTAssertEqual(session.phase, .settling)
+        XCTAssertEqual(session.phase, .continuedBreathing)
         session.update(now: start.addingTimeInterval(300))
         XCTAssertEqual(session.phase, .completed)
         XCTAssertTrue(session.canExtend)
@@ -82,7 +95,7 @@ final class RescueSessionTests: XCTestCase {
     }
 
     func testSoundAvailabilityMatchesAccessLevel() {
-        XCTAssertEqual(Set(RescueAccess.free.availableSoundscapes), Set([.breeze, .silence]))
+        XCTAssertEqual(Set(RescueAccess.free.availableSoundscapes), Set(RescueSoundscape.allCases))
         XCTAssertEqual(Set(RescueAccess.premium.availableSoundscapes), Set(RescueSoundscape.allCases))
     }
 
@@ -106,16 +119,17 @@ final class RescueSessionTests: XCTestCase {
         XCTAssertEqual(session.phase, .completed)
     }
 
-    func testFreeCannotExtendOrSelectPremiumAudio() {
+    func testDevelopmentAccessAllowsAllSoundsAndExtension() {
         var session = RescueSession(access: .free, startDate: start)
         session.select(.soundscape(.forest))
-        XCTAssertEqual(session.selectedSound, .breeze)
-        XCTAssertEqual(session.soundSelection, .random)
+        XCTAssertEqual(session.selectedSound, .forest)
+        XCTAssertEqual(session.soundSelection, .soundscape(.forest))
         session.update(now: start.addingTimeInterval(120))
         session.answerCheckIn(isEasier: true)
-        session.startExtension(at: start.addingTimeInterval(120))
-        XCTAssertEqual(session.phase, .completed)
-        XCTAssertNil(session.extensionStartDate)
+        session.update(now: start.addingTimeInterval(300))
+        session.startExtension(at: start.addingTimeInterval(300))
+        XCTAssertEqual(session.phase, .extended)
+        XCTAssertEqual(session.extensionStartDate, start.addingTimeInterval(300))
     }
 
     func testSingleFreeSoundCanRepeatAndSilenceOnlyPoolIsEmpty() {
@@ -129,9 +143,44 @@ final class RescueSessionTests: XCTestCase {
         XCTAssertTrue(session.isMuted)
         session.select(.random)
         XCTAssertFalse(session.isMuted)
-        XCTAssertEqual(session.selectedSound, .breeze)
+        XCTAssertNotEqual(session.selectedSound, .silence)
+        XCTAssertNotNil(session.selectedSound)
         session.toggleMute()
         XCTAssertTrue(session.isMuted)
         XCTAssertEqual(session.startDate, start)
+    }
+
+    func testCompletionOccursEvenWhileMyWhyIsOpen() {
+        var session = RescueSession(access: .free, startDate: start)
+        session.update(now: start.addingTimeInterval(120))
+        session.answerCheckIn(isEasier: false)
+        session.update(now: start.addingTimeInterval(300))
+        XCTAssertEqual(session.phase, .completed)
+        XCTAssertEqual(session.elapsed, 300)
+    }
+
+    func testNewSessionRandomUsesAllSoundsAndExcludesPrevious() {
+        let session = RescueSession(access: .free, startDate: start, lastRandomSound: .rain, randomIndex: { $0.lowerBound })
+        XCTAssertEqual(session.selectedSound, .ocean)
+        let last = RescueSession(access: .free, startDate: start, randomIndex: { $0.upperBound - 1 })
+        XCTAssertEqual(last.selectedSound, .warmAmbient)
+    }
+
+    func testEveryAmbientSoundMapsToItsOwnBundledWAV() throws {
+        let expected: [RescueSoundscape: String] = [
+            .rain: "rain.wav", .ocean: "ocean.wav", .forest: "forest.wav",
+            .breeze: "breeze.wav", .night: "night.wav", .warmAmbient: "warmAmbient.wav"
+        ]
+        XCTAssertEqual(expected.count, RescueSoundscape.allCases.count - 1)
+        for (sound, filename) in expected {
+            XCTAssertEqual(sound.resourceFilename, filename)
+            let url = try XCTUnwrap(sound.resourceURL(), "Missing bundled asset: \(filename)")
+            XCTAssertEqual(url.lastPathComponent, filename)
+            let data = try Data(contentsOf: url)
+            XCTAssertGreaterThan(data.count, 44)
+            XCTAssertEqual(String(data: data.prefix(4), encoding: .ascii), "RIFF")
+        }
+        XCTAssertNil(RescueSoundscape.silence.resourceFilename)
+        XCTAssertNil(RescueSoundscape.silence.resourceURL())
     }
 }
