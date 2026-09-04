@@ -14,6 +14,9 @@ struct WelcomeView: View {
                 Image(systemName: "leaf").font(.system(size: 46, weight: .light)).foregroundStyle(AppColor.sage)
                 Text("Ready to quit for good?")
                     .font(.largeTitle.bold()).fixedSize(horizontal: false, vertical: true).accessibilityAddTraits(.isHeader)
+                Text("We’ll help you keep going.")
+                    .font(.title2.bold())
+                    .foregroundStyle(AppColor.secondaryText)
                 VStack(alignment: .leading, spacing: 18) {
                     benefit("clock", "Track your smoke-free progress")
                     benefit("banknote", "See the money you’re keeping")
