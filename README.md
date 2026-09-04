@@ -2,6 +2,11 @@
 
 A calm, native SwiftUI quit-smoking companion with SwiftData persistence.
 
+## Links
+
+- [Support](https://appi-dev.github.io/dont-smoke-ios/support.html)
+- [Privacy Policy](https://appi-dev.github.io/dont-smoke-ios/privacy.html)
+
 ## Run
 
 Open `DontSmoke.xcodeproj` in Xcode and run the `DontSmoke` scheme on an iPhone simulator running iOS 17 or later.
