@@ -83,11 +83,17 @@ struct CravingRescueView: View {
         } label: {
             Label(soundLabel, systemImage: session.isMuted || session.selectedSound == .silence ? "speaker.slash" : "speaker.wave.2")
                 .font(.caption)
-                .padding(.horizontal, 12)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .frame(width: 170)
                 .frame(minHeight: 44)
                 .foregroundStyle(AppColor.sage)
                 .background(AppColor.surface, in: Capsule())
+                .contentShape(Capsule())
+                .clipShape(Capsule())
         }
+        .buttonStyle(.plain)
+        .transaction { transaction in transaction.animation = nil }
         .accessibilityLabel("Ambient sound")
         .accessibilityValue(soundAccessibilityValue)
         .accessibilityHint("Choose or mute the calming background sound.")
