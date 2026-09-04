@@ -12,7 +12,7 @@ enum QuitReason: String, CaseIterable, Identifiable, Codable {
     var isPersonal: Bool { [.family, .children, .partner].contains(self) }
 }
 
-enum CravingTrigger: String, CaseIterable, Identifiable, Codable {
+enum CravingTrigger: String, CaseIterable, Identifiable, Codable, Sendable {
     case morningCoffee, afterBreakfast, afterLunch, afterDinner, driving, workStress, alcohol, social, boredom, lateNight, other
     var id: String { rawValue }
     var title: String { switch self {
@@ -51,6 +51,11 @@ enum NotificationPreference: String, Codable { case notAsked, enabled, declined,
         notificationPreferenceRaw = notificationPreference.rawValue; onboardingCompleted = true; createdAt = .now; goals = []; cravingSchedules = []
     }
     var primaryReason: QuitReason { QuitReason(rawValue: primaryReasonRaw) ?? .other }
+    var notificationPreference: NotificationPreference {
+        get { NotificationPreference(rawValue: notificationPreferenceRaw) ?? .notAsked }
+        set { notificationPreferenceRaw = newValue.rawValue }
+    }
+    var triggers: [CravingTrigger] { triggerRaws.compactMap(CravingTrigger.init(rawValue:)) }
 }
 
 @Model final class SavingsGoal {
@@ -62,6 +67,12 @@ enum NotificationPreference: String, Codable { case notAsked, enabled, declined,
 
 @Model final class CravingSchedule {
     @Attribute(.unique) var id: UUID
-    var triggerRaw: String; var preferredTime: Date; var profile: QuitProfile?
-    init(trigger: CravingTrigger, preferredTime: Date) { id = UUID(); triggerRaw = trigger.rawValue; self.preferredTime = preferredTime }
+    var triggerRaw: String
+    var preferredTime: Date
+    var reminderEnabled: Bool = true
+    var profile: QuitProfile?
+    init(id: UUID = UUID(), trigger: CravingTrigger, preferredTime: Date, reminderEnabled: Bool = true) {
+        self.id = id; triggerRaw = trigger.rawValue; self.preferredTime = preferredTime; self.reminderEnabled = reminderEnabled
+    }
+    var trigger: CravingTrigger { CravingTrigger(rawValue: triggerRaw) ?? .other }
 }

@@ -4,10 +4,12 @@ import PhotosUI
 struct MainTabView: View {
     let profile: QuitProfile
     @State private var selectedTab = AppTab.today
+    @State private var showRescue = false
+    private let navigation = AppNavigation.shared
 
     var body: some View {
         TabView(selection: $selectedTab) {
-            TodayView(profile: profile) { selectedTab = .me }
+            TodayView(profile: profile, showRescue: { showRescue = true }) { selectedTab = .me }
                 .tabItem { Label("Today", systemImage: "sun.max.fill") }.tag(AppTab.today)
             ProgressViewScreen(profile: profile)
                 .tabItem { Label("Progress", systemImage: "chart.line.uptrend.xyaxis") }.tag(AppTab.progress)
@@ -17,6 +19,16 @@ struct MainTabView: View {
         .tint(AppColor.sage)
         .toolbarBackground(AppColor.background, for: .tabBar)
         .toolbarBackground(.visible, for: .tabBar)
+        .fullScreenCover(isPresented: $showRescue) { CravingRescueView(profile: profile) }
+        .onChange(of: navigation.shouldOpenCravingRescue) { _, shouldOpen in
+            guard shouldOpen else { return }
+            selectedTab = .today; showRescue = true; navigation.shouldOpenCravingRescue = false
+        }
+        .task {
+            if navigation.shouldOpenCravingRescue {
+                selectedTab = .today; showRescue = true; navigation.shouldOpenCravingRescue = false
+            }
+        }
     }
 }
 
@@ -24,8 +36,8 @@ private enum AppTab: Hashable { case today, progress, me }
 
 private struct TodayView: View {
     let profile: QuitProfile
+    let showRescue: () -> Void
     let editWhy: () -> Void
-    @State private var showRescue = false
     @AppStorage("showMyWhyOnToday") private var showMyWhyOnToday = true
     var body: some View {
         NavigationStack {
@@ -42,7 +54,7 @@ private struct TodayView: View {
                                 Text("\(duration.hours) hours  \(duration.minutes) min").font(.title2.weight(.semibold)).foregroundStyle(AppColor.sage)
                             }.accessibilityElement(children: .combine)
                         }.padding(.top, 36)
-                        Button { showRescue = true } label: {
+                        Button(action: showRescue) {
                             Label("I WANT TO SMOKE", systemImage: "wind")
                                 .font(.headline)
                                 .frame(maxWidth: .infinity, minHeight: 54)
@@ -73,7 +85,6 @@ private struct TodayView: View {
             }
             .background(AppColor.background.ignoresSafeArea()).foregroundStyle(AppColor.text)
             .navigationTitle("Don’t Smoke").navigationBarTitleDisplayMode(.inline)
-            .fullScreenCover(isPresented: $showRescue) { CravingRescueView(profile: profile) }
         }
     }
 }
@@ -104,7 +115,6 @@ private struct ProgressViewScreen: View {
 
 private struct MeView: View {
     @Bindable var profile: QuitProfile
-    @AppStorage("notificationsEnabled") private var notificationsEnabled = false
     @AppStorage("whyPhotoRevision") private var photoRevision = ""
     @AppStorage("showMyWhyOnToday") private var showMyWhyOnToday = true
     @State private var selectedPhoto: PhotosPickerItem?
@@ -130,7 +140,10 @@ private struct MeView: View {
                     }
                 }
             }
-            Section("Preferences") { Toggle("Notifications", isOn: $notificationsEnabled); LabeledContent("Appearance", value: "Dark") }
+            Section("Preferences") {
+                NavigationLink("Craving Reminders") { CravingRemindersView(profile: profile) }
+                LabeledContent("Appearance", value: "Dark")
+            }
             Section {
                 Button("Replay App Tour") { showAppTour = true }
             }

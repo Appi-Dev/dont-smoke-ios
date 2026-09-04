@@ -4,24 +4,47 @@ import SwiftData
 struct OnboardingFlowView: View {
     @Environment(\.modelContext) private var modelContext
     @State private var model = OnboardingViewModel()
+    @State private var isFinishing = false
     var body: some View {
-        OnboardingShell(step: model.step * 2 + 1, back: model.step == 0 ? nil : { model.back() }) {
+        OnboardingShell(step: model.step, back: model.step == 0 ? nil : { model.back() }) {
             ScrollView { Group {
                 switch model.step {
                 case 0: LastSmokeStep(model: model)
                 case 1: DailyAmountStep(model: model)
                 case 2: CostStep(model: model)
-                default: WhyStep(model: model, complete: complete)
+                case 3: WhyStep(model: model) { model.next() }
+                case 4: TriggerStep(model: model, skip: { complete(.deferred) }) {
+                    model.triggerTimes.isEmpty ? complete(.deferred) : model.next()
+                }
+                case 5: TriggerTimeStep(model: model) {
+                    model.triggerTimes.isEmpty ? complete(.deferred) : model.next()
+                }
+                default: NotificationContextStep(isFinishing: isFinishing, notNow: { complete(.deferred) }) {
+                    Task {
+                        isFinishing = true
+                        let permission = await NotificationService.scheduler.requestAuthorizationIfNeeded()
+                        complete(permission == .authorized || permission == .provisional ? .enabled : .declined)
+                    }
+                }
                 }
             }.padding(.horizontal, 24).padding(.bottom, 28).frame(maxWidth: 680) }.scrollDismissesKeyboard(.interactively)
         }
     }
-    private func complete() {
+    private func complete(_ notificationPreference: NotificationPreference) {
+        guard !isFinishing || notificationPreference != .deferred else { return }
         guard let reason = model.primaryReason else { return }
         let profile = QuitProfile(quitDate: model.quitDate, cigarettesPerDay: model.cigarettesPerDay, packPrice: model.packPrice,
             packSize: model.packSize, currencyCode: model.currencyCode, primaryReason: reason, reasons: Array(model.reasons), personalReasonText: model.personalReasonText.nilIfBlank,
-            triggers: [], notificationPreference: .notAsked)
-        modelContext.insert(profile); try? modelContext.save()
+            triggers: Array(model.triggers), notificationPreference: notificationPreference)
+        modelContext.insert(profile)
+        let schedules = model.triggerTimes.map { trigger, time in
+            let schedule = CravingSchedule(trigger: trigger, preferredTime: time, reminderEnabled: notificationPreference == .enabled)
+            schedule.profile = profile; modelContext.insert(schedule); return schedule
+        }
+        try? modelContext.save()
+        if notificationPreference == .enabled {
+            Task { for schedule in schedules { await NotificationService.scheduler.scheduleReminder(id: schedule.id, trigger: schedule.trigger, cravingTime: schedule.preferredTime) } }
+        }
     }
 }
 
@@ -81,7 +104,61 @@ private struct WhyStep: View {
         ForEach(reasons, id: \.0) { reason, title in ChoiceCard(title: title, selected: model.primaryReason == reason) { model.reasons = [reason]; model.primaryReason = reason } }
         if model.primaryReason == .other { TextField("Your reason", text: $model.personalReasonText).textFieldStyle(.roundedBorder).padding(.top, 6) }
         Text("Keep what you’ve gained.").font(.headline).foregroundStyle(AppColor.sage).padding(.vertical, 10)
-        PrimaryButton(title: "Start my smoke-free life", disabled: model.primaryReason == nil || (model.primaryReason == .other && model.personalReasonText.nilIfBlank == nil), action: complete)
+        PrimaryButton(title: "Continue", disabled: model.primaryReason == nil || (model.primaryReason == .other && model.personalReasonText.nilIfBlank == nil), action: complete)
+    } }
+}
+
+private struct TriggerStep: View {
+    @Bindable var model: OnboardingViewModel
+    let skip: () -> Void
+    let next: () -> Void
+    var body: some View { VStack(alignment: .leading, spacing: 14) {
+        Spacer(minLength: 24)
+        Text("When do cravings usually hit?").font(.largeTitle.bold())
+        Text("We can remind you a little before your usual difficult moments.").foregroundStyle(AppColor.secondaryText).padding(.bottom, 8)
+        ForEach(CravingTrigger.allCases) { trigger in
+            ChoiceCard(title: trigger.title, selected: model.triggers.contains(trigger)) { model.toggleTrigger(trigger) }
+        }
+        PrimaryButton(title: "Continue", action: next)
+        Button("Skip for now", action: skip).frame(maxWidth: .infinity, minHeight: 44).foregroundStyle(AppColor.secondaryText)
+    } }
+}
+
+private struct TriggerTimeStep: View {
+    @Bindable var model: OnboardingViewModel
+    let next: () -> Void
+    var body: some View { VStack(alignment: .leading, spacing: 18) {
+        Spacer(minLength: 24)
+        Text("Choose an approximate time").font(.largeTitle.bold())
+        Text("Only triggers with a time can send a reminder. You can change these later.").foregroundStyle(AppColor.secondaryText)
+        ForEach(model.triggers.sorted { $0.rawValue < $1.rawValue }) { trigger in
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle(trigger.title, isOn: Binding(get: { model.triggerTimes[trigger] != nil }, set: { model.setTimed($0, for: trigger) }))
+                    .tint(AppColor.sage)
+                if let time = model.triggerTimes[trigger] {
+                    DatePicker(trigger.timingQuestion, selection: Binding(get: { time }, set: { model.triggerTimes[trigger] = $0 }), displayedComponents: .hourAndMinute)
+                        .tint(AppColor.sage)
+                } else if !trigger.predictable {
+                    Text("Saved without a reminder time.").font(.footnote).foregroundStyle(AppColor.secondaryText)
+                }
+            }.padding().background(AppColor.surface, in: RoundedRectangle(cornerRadius: 16))
+        }
+        PrimaryButton(title: "Continue", action: next)
+    } }
+}
+
+private struct NotificationContextStep: View {
+    let isFinishing: Bool
+    let notNow: () -> Void
+    let enable: () -> Void
+    var body: some View { VStack(spacing: 22) {
+        Spacer(minLength: 70)
+        Image(systemName: "bell.badge").font(.system(size: 48, weight: .light)).foregroundStyle(AppColor.sage)
+        Text("Want a little support before cravings usually hit?").font(.largeTitle.bold()).multilineTextAlignment(.center)
+        Text("We can send a calm reminder a few minutes beforehand.").foregroundStyle(AppColor.secondaryText).multilineTextAlignment(.center)
+        Spacer(minLength: 30)
+        PrimaryButton(title: isFinishing ? "Enabling…" : "Enable reminders", disabled: isFinishing, action: enable)
+        Button("Not now", action: notNow).disabled(isFinishing).frame(minHeight: 44).foregroundStyle(AppColor.secondaryText)
     } }
 }
 

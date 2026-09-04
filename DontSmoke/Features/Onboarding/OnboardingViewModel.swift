@@ -16,20 +16,15 @@ final class OnboardingViewModel {
     var triggers: Set<CravingTrigger> = []
     var triggerTimes: [CravingTrigger: Date] = [:]
     var notificationPreference: NotificationPreference = .notAsked
-    var wantsGoal = false
-    var goalName = ""
-    var goalAmountText = ""
-    var goalIcon = "💰"
 
     var packPrice: Decimal { Decimal(string: packPriceText) ?? 0 }
     var dailySpend: Decimal { QuitCalculations.dailySpending(packPrice: packPrice, packSize: packSize, cigarettesPerDay: cigarettesPerDay) }
     var timedTriggers: [CravingTrigger] { triggers.filter(\.predictable).sorted { $0.rawValue < $1.rawValue } }
     var canContinue: Bool {
-        switch step { case 1: cigarettesPerDay > 0; case 2: packPrice > 0 && packSize > 0; case 3: !reasons.isEmpty && primaryReason != nil
-        case 8: !wantsGoal || (!goalName.trimmingCharacters(in: .whitespaces).isEmpty && (Decimal(string: goalAmountText) ?? 0) > 0); default: true }
+        switch step { case 1: cigarettesPerDay > 0; case 2: packPrice > 0 && packSize > 0; case 3: !reasons.isEmpty && primaryReason != nil; default: true }
     }
 
-    func next() { withAnimation(.easeInOut(duration: 0.25)) { step = min(3, step + 1) } }
+    func next() { withAnimation(.easeInOut(duration: 0.25)) { step = min(6, step + 1) } }
     func back() { withAnimation(.easeInOut(duration: 0.25)) { step = max(0, step - 1) } }
     func chooseDate(_ choice: Int) {
         dateChoice = choice
@@ -44,8 +39,11 @@ final class OnboardingViewModel {
         if triggers.remove(trigger) == nil { triggers.insert(trigger); if trigger.predictable { triggerTimes[trigger] = defaultTime(for: trigger) } }
         else { triggerTimes[trigger] = nil }
     }
-    private func defaultTime(for trigger: CravingTrigger) -> Date {
+    func defaultTime(for trigger: CravingTrigger) -> Date {
         let hour: Int = switch trigger { case .morningCoffee: 8; case .afterBreakfast: 9; case .afterLunch: 14; case .afterDinner: 21; case .lateNight: 23; default: 12 }
         return Calendar.current.date(bySettingHour: hour, minute: 0, second: 0, of: .now) ?? .now
+    }
+    func setTimed(_ enabled: Bool, for trigger: CravingTrigger) {
+        triggerTimes[trigger] = enabled ? (triggerTimes[trigger] ?? defaultTime(for: trigger)) : nil
     }
 }
