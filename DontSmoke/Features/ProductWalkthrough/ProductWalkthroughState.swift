@@ -16,7 +16,7 @@ enum ProductWalkthroughPage: Int, CaseIterable, Identifiable {
         switch self {
         case .progress: "This is how long you’ve kept going."
         case .gains: "Every cigarette you skip means more money kept and fewer cigarettes smoked."
-        case .myWhy: "When motivation gets difficult, remember why you started."
+        case .myWhy: "When motivation feels difficult, remember why you started. You can add a photo that helps you reconnect with your reason and keep moving forward."
         case .craving: "Tap ‘I WANT TO SMOKE’ and take a few minutes. We can also remind you before usual craving times."
         case .keepWhatYouGained: "Don’t focus on what you gave up. Focus on what you’ve kept."
         }
