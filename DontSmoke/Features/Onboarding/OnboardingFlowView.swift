@@ -27,7 +27,9 @@ struct OnboardingFlowView: View {
                     }
                 }
                 }
-            }.padding(.horizontal, 24).padding(.bottom, 28).frame(maxWidth: 680) }.scrollDismissesKeyboard(.interactively)
+            }.padding(.horizontal, 24).padding(.bottom, 28).frame(maxWidth: 680) }
+                .id(model.step)
+                .scrollDismissesKeyboard(.interactively)
         }
     }
     private func complete(_ notificationPreference: NotificationPreference) {
