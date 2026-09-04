@@ -166,10 +166,10 @@ final class RescueSessionTests: XCTestCase {
         XCTAssertEqual(last.selectedSound, .warmAmbient)
     }
 
-    func testEveryAmbientSoundMapsToItsOwnBundledWAV() throws {
+    func testEveryAmbientSoundMapsToItsOwnBundledRecording() throws {
         let expected: [RescueSoundscape: String] = [
-            .rain: "rain.wav", .ocean: "ocean.wav", .forest: "forest.wav",
-            .breeze: "breeze.wav", .night: "night.wav", .warmAmbient: "warmAmbient.wav"
+            .rain: "rain.mp3", .ocean: "ocean.mp3", .forest: "forest.mp3",
+            .breeze: "breeze.mp3", .night: "night.mp3", .warmAmbient: "warmAmbient.mp3"
         ]
         XCTAssertEqual(expected.count, RescueSoundscape.allCases.count - 1)
         for (sound, filename) in expected {
@@ -177,8 +177,7 @@ final class RescueSessionTests: XCTestCase {
             let url = try XCTUnwrap(sound.resourceURL(), "Missing bundled asset: \(filename)")
             XCTAssertEqual(url.lastPathComponent, filename)
             let data = try Data(contentsOf: url)
-            XCTAssertGreaterThan(data.count, 44)
-            XCTAssertEqual(String(data: data.prefix(4), encoding: .ascii), "RIFF")
+            XCTAssertGreaterThan(data.count, 1_024)
         }
         XCTAssertNil(RescueSoundscape.silence.resourceFilename)
         XCTAssertNil(RescueSoundscape.silence.resourceURL())

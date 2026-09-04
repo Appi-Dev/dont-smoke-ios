@@ -34,10 +34,10 @@ enum RescueSoundscape: String, CaseIterable, Identifiable, Codable {
     }
 
     var resourceName: String { rawValue }
-    var resourceFilename: String? { self == .silence ? nil : "\(resourceName).wav" }
+    var resourceFilename: String? { self == .silence ? nil : "\(resourceName).mp3" }
     func resourceURL(in bundle: Bundle = .main) -> URL? {
         guard self != .silence else { return nil }
-        return bundle.url(forResource: resourceName, withExtension: "wav")
+        return bundle.url(forResource: resourceName, withExtension: "mp3")
     }
 }
 
