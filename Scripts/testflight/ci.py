@@ -27,6 +27,12 @@ BASE = 'https://api.appstoreconnect.apple.com'
 class SafeError(Exception):
     """Only deliberately sanitized messages may be printed."""
 
+class APIError(SafeError):
+    def __init__(self, method, status):
+        self.status = status
+        super().__init__(f'App Store Connect {method} failed (HTTP {status}); details suppressed')
+
+
 
 def require(name):
     value = os.environ.get(name, '')
@@ -137,7 +143,7 @@ class API:
                 if method == 'GET' and (error.code == 429 or error.code >= 500) and attempt < 4:
                     time.sleep(min(30, 2 ** attempt * 2))
                     continue
-                raise SafeError(f'App Store Connect {method} failed (HTTP {error.code}); details suppressed') from None
+                raise APIError(method, error.code) from None
             except (urllib.error.URLError, TimeoutError):
                 if method == 'GET' and attempt < 4:
                     time.sleep(2 ** attempt)
@@ -383,6 +389,7 @@ def build():
     print('Signed archive and IPA export succeeded; exported version verified')
 
 
+
 def upload():
     save(upload='started')
     keydir = ROOT / 'private_keys'
@@ -477,27 +484,59 @@ def distribute():
             tester = found[0]
             existing_count += 1
         else:
-            tester = api.request('POST', '/v1/betaTesters', {'data': {
-                'type': 'betaTesters', 'attributes': row,
-                'relationships': {'betaGroups': {'data': [linkage('betaGroups', group_id)]}}}})['data']
-            created += 1
-            members.add(tester['id'])
-            added += 1
+            try:
+                tester = api.request('POST', '/v1/betaTesters', {'data': {
+                    'type': 'betaTesters', 'attributes': row,
+                    'relationships': {'betaGroups': {'data': [linkage('betaGroups', group_id)]}}}})['data']
+            except APIError as error:
+                if error.status not in (409, 422):
+                    raise
+                # Another run may have created the same tester. Read, never retry creation.
+                found = []
+                for attempt in range(3):
+                    found = api.all('/v1/betaTesters', {'filter[email]': row['email']})
+                    if found:
+                        break
+                    if attempt < 2:
+                        time.sleep(2)
+                if len(found) != 1 or found[0]['attributes'].get('email', '').casefold() != row['email'].casefold():
+                    raise error
+                tester = found[0]
+                existing_count += 1
+            else:
+                created += 1
+                members.add(tester['id'])
+                added += 1
         tester_id = tester['id']
         if tester_id not in members:
-            api.request('POST', f'/v1/betaGroups/{group_id}/relationships/betaTesters',
-                        {'data': [linkage('betaTesters', tester_id)]})
-            added += 1
+            try:
+                api.request('POST', f'/v1/betaGroups/{group_id}/relationships/betaTesters',
+                            {'data': [linkage('betaTesters', tester_id)]})
+            except APIError as error:
+                if error.status != 409 or not any(t['id'] == tester_id for t in
+                        api.all(f'/v1/betaGroups/{group_id}/betaTesters')):
+                    raise
+            else:
+                added += 1
+            members.add(tester_id)
         save(testers_created=created, testers_existing=existing_count,
              testers_added=added, invitations_requested=invited)
         if external in ('BETA_APPROVED', 'READY_FOR_BETA_TESTING', 'IN_BETA_TESTING'):
             tester = api.request('GET', f'/v1/betaTesters/{tester_id}')['data']
         if external in ('BETA_APPROVED', 'READY_FOR_BETA_TESTING', 'IN_BETA_TESTING') and tester['attributes'].get('state') == 'NOT_INVITED':
-            api.request('POST', '/v1/betaTesterInvitations', {'data': {
-                'type': 'betaTesterInvitations', 'relationships': {
-                    'app': {'data': linkage('apps', state['app'])},
-                    'betaTester': {'data': linkage('betaTesters', tester_id)}}}})
-            invited += 1
+            try:
+                api.request('POST', '/v1/betaTesterInvitations', {'data': {
+                    'type': 'betaTesterInvitations', 'relationships': {
+                        'app': {'data': linkage('apps', state['app'])},
+                        'betaTester': {'data': linkage('betaTesters', tester_id)}}}})
+            except APIError as error:
+                if error.status != 409:
+                    raise
+                confirmed_tester = api.request('GET', f'/v1/betaTesters/{tester_id}')['data']
+                if confirmed_tester['attributes'].get('state') not in ('INVITED', 'ACCEPTED', 'INSTALLED'):
+                    raise
+            else:
+                invited += 1
         save(testers_created=created, testers_existing=existing_count,
              testers_added=added, invitations_requested=invited)
     confirmed = {t['id'] for t in api.all(f'/v1/betaGroups/{group_id}/betaTesters')}
@@ -525,7 +564,7 @@ def summary():
     state = read_state()
     rows = [('Job', os.environ.get('TF_JOB_STATUS', 'unknown')),
             ('Marketing version', VERSION), ('Build number', state.get('build', 'not assigned'))]
-    for label, key in [('Reservation', 'reservation_id'), ('Reservation status', 'reservation_status'), ('Submission queue', 'queue'), ('IPA transfer', 'transfer'), ('Preflight', 'preparation'), ('Archive', 'archive'), ('IPA export', 'export'),
+    for label, key in [('Reservation', 'reservation_id'), ('Reservation status', 'reservation_status'), ('Reservation recovery', 'recovery'), ('IPA transfer', 'transfer'), ('Preflight', 'preparation'), ('Archive', 'archive'), ('IPA export', 'export'),
                        ('Upload', 'upload'), ('Apple processing', 'processing'), ('External group', 'group_name'),
                        ('Group assignment', 'group'), ('Beta App Review', 'beta_review'),
                        ('Distribution', 'distribution'), ('Invitations', 'invitations'),

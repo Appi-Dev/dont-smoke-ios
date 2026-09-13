@@ -169,6 +169,44 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(state['invitations_requested'], 1)
         self.assertEqual(state['testers_verified'], 1)
 
+    def test_concurrent_tester_creation_is_reused_without_retry(self):
+        api = FakeAPI('IN_BETA_TESTING')
+        original = api.request
+        def request(method, path, body=None, params=None):
+            result = original(method, path, body, params)
+            if method == 'POST' and path == '/v1/betaTesters':
+                raise ci.APIError(method, 409)
+            return result
+        with patch.object(api, 'request', side_effect=request):
+            self.distribute(api)
+        self.assertEqual(ci.read_state()['testers_created'], 0)
+        self.assertEqual(ci.read_state()['testers_existing'], 1)
+        self.assertEqual(sum(m == 'POST' and p == '/v1/betaTesters' for m, p, _ in api.calls), 1)
+
+    def test_creation_conflict_without_matching_tester_fails(self):
+        api = FakeAPI()
+        original = api.request
+        def request(method, path, body=None, params=None):
+            if method == 'POST' and path == '/v1/betaTesters':
+                raise ci.APIError(method, 422)
+            return original(method, path, body, params)
+        with patch.object(api, 'request', side_effect=request), patch.object(ci.time, 'sleep'):
+            with self.assertRaises(ci.APIError):
+                self.distribute(api)
+
+    def test_concurrent_membership_and_invitation_are_confirmed(self):
+        api = FakeAPI('IN_BETA_TESTING', existing=True)
+        original = api.request
+        def request(method, path, body=None, params=None):
+            result = original(method, path, body, params)
+            if method == 'POST' and (path.endswith('/relationships/betaTesters') or path == '/v1/betaTesterInvitations'):
+                raise ci.APIError(method, 409)
+            return result
+        with patch.object(api, 'request', side_effect=request):
+            self.distribute(api)
+        self.assertEqual(ci.read_state()['testers_verified'], 1)
+        self.assertEqual(ci.read_state()['invitations_requested'], 0)
+
     def test_rejected_review_does_not_invite_testers(self):
         api = FakeAPI('BETA_REJECTED')
         with self.assertRaises(ci.SafeError):

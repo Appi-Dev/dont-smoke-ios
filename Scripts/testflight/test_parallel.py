@@ -1,4 +1,4 @@
-"""Offline reservation, queue, and encrypted transfer safety tests."""
+"""Offline reservation, parallel submission, and encrypted transfer safety tests."""
 import copy
 import importlib.util
 import io
@@ -75,19 +75,16 @@ class ParallelTests(unittest.TestCase):
         self.assertEqual(self.add(state, '1.1', ['20', '9000.1.2'])['build'], '21')
         self.assertEqual(self.add(state, '2.1', ['20'])['build'], '22')
 
-    def test_finished_out_of_order_cannot_upload_ahead(self):
-        state = self.ledger()
-        self.add(state, '1.1')
-        self.add(state, '2.1')
-        queue.transition(state, '2.1', 'ready')
-        with self.assertRaises(ci.SafeError):
-            queue.transition(state, '2.1', 'uploading')
-        queue.transition(state, '1.1', 'ready')
-        queue.transition(state, '1.1', 'uploading')
-        with self.assertRaises(ci.SafeError):
-            queue.transition(state, '2.1', 'uploading')
-        queue.transition(state, '1.1', 'completed')
-        queue.transition(state, '2.1', 'uploading')
+    def test_other_reservation_states_never_prevent_upload(self):
+        for status in ('building', 'ready', 'uploading', 'blocked', 'completed', 'skipped'):
+            with self.subTest(status=status):
+                state = self.ledger()
+                self.add(state, '1.1')
+                self.add(state, '2.1')
+                state['reservations'][0]['status'] = status
+                queue.transition(state, '2.1', 'ready')
+                self.assertEqual(queue.transition(state, '2.1', 'uploading')['status'], 'uploading')
+                self.assertEqual(state['reservations'][0]['status'], status)
 
     def test_upload_claim_cannot_be_replayed(self):
         state = self.ledger()
@@ -121,7 +118,7 @@ class ParallelTests(unittest.TestCase):
                'TF_RECOVERY_RESOLUTION': 'completed', 'GITHUB_RUN_ID': 'recovery'}
         with patch.dict(os.environ, env), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'change', side_effect=lambda f: f(state)), patch.object(api, 'request', return_value={'status': 'completed'}), patch.object(queue, 'save'):
             queue.recover()
-        self.assertTrue(queue.is_turn(state, '2.1'))
+        self.assertEqual(state['reservations'][1]['status'], 'building')
         self.assertEqual(state['reservations'][0]['recovered_by_run'], 'recovery')
 
     def test_failed_build_skips_but_number_is_never_reused(self):
@@ -130,7 +127,7 @@ class ParallelTests(unittest.TestCase):
         queue.transition(state, '1.1', 'skipped')
         row = self.add(state, '2.1')
         self.assertEqual(row['build'], '22')
-        self.assertTrue(queue.is_turn(state, '2.1'))
+        self.assertEqual(state['reservations'][1]['status'], 'building')
 
     def test_uncertain_upload_cannot_be_automatically_skipped(self):
         state = self.ledger()
@@ -141,7 +138,8 @@ class ParallelTests(unittest.TestCase):
         queue.transition(state, '1.1', 'blocked')
         with self.assertRaises(ci.SafeError):
             queue.transition(state, '1.1', 'skipped')
-        self.assertFalse(queue.is_turn(state, '2.1'))
+        queue.transition(state, '2.1', 'ready')
+        queue.transition(state, '2.1', 'uploading')
 
     def test_compare_and_swap_retries_against_updated_remote_ledger(self):
         state = self.ledger()
@@ -172,42 +170,6 @@ class ParallelTests(unittest.TestCase):
         with patch.object(api, 'request', side_effect=queue.Conflict(404)):
             with self.assertRaises(ci.SafeError):
                 api.load()
-
-    def test_gate_skips_cancelled_preupload_attempt(self):
-        state = self.ledger()
-        self.add(state, '1.1')
-        self.add(state, '2.1')
-        queue.transition(state, '2.1', 'ready')
-        api = queue.GitHub()
-        with patch.dict(os.environ, {'GITHUB_RUN_ID': '2', 'GITHUB_RUN_ATTEMPT': '1'}), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'load', side_effect=lambda: (state, 'sha')), patch.object(api, 'request', return_value={'status': 'completed'}), patch.object(api, 'change', side_effect=lambda f: f(state)), patch.object(queue.time, 'sleep'), patch.object(queue, 'save'):
-            queue.gate(seconds=10)
-        self.assertEqual(state['reservations'][0]['status'], 'skipped')
-
-    def test_gate_reports_blocked_upload_without_waiting_forever(self):
-        state = self.ledger()
-        self.add(state, '1.1')
-        self.add(state, '2.1')
-        queue.transition(state, '1.1', 'ready')
-        queue.transition(state, '1.1', 'uploading')
-        queue.transition(state, '2.1', 'ready')
-        api = queue.GitHub()
-        with patch.dict(os.environ, {'GITHUB_RUN_ID': '2', 'GITHUB_RUN_ATTEMPT': '1'}), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'load', return_value=(state, 'sha')), patch.object(api, 'request', return_value={'status': 'completed'}):
-            with self.assertRaises(ci.SafeError):
-                queue.gate(seconds=10)
-
-    def test_gate_waits_for_a_normally_running_upload(self):
-        state = self.ledger()
-        self.add(state, '1.1')
-        self.add(state, '2.1')
-        queue.transition(state, '1.1', 'ready')
-        queue.transition(state, '1.1', 'uploading')
-        queue.transition(state, '2.1', 'ready')
-        api = queue.GitHub()
-        def complete(_):
-            queue.transition(state, '1.1', 'completed')
-        with patch.dict(os.environ, {'GITHUB_RUN_ID': '2', 'GITHUB_RUN_ATTEMPT': '1'}), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'load', side_effect=lambda: (state, 'sha')), patch.object(api, 'request', return_value={'status': 'in_progress'}), patch.object(queue.time, 'sleep', side_effect=complete), patch.object(queue, 'save'):
-            queue.gate(seconds=10)
-        self.assertTrue(queue.is_turn(state, '2.1'))
 
     def test_recovery_requires_apple_confirmation(self):
         with patch.dict(os.environ, {'TF_RECOVERY_CONFIRMED': 'false'}):

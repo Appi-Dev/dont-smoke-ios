@@ -132,54 +132,14 @@ def transition(ledger, reservation_id, status):
         return copy.deepcopy(row)
     if status not in allowed.get(row['status'], set()):
         raise SafeError('Refused invalid reservation transition')
-    if status == 'uploading' and not is_turn(ledger, reservation_id):
-        raise SafeError('A lower reserved build must be resolved before upload')
     row['status'] = status
     return copy.deepcopy(row)
-
-
-def is_turn(ledger, reservation_id):
-    pending = [r for r in ledger['reservations'] if r['status'] not in TERMINAL]
-    return bool(pending) and min(pending, key=lambda r: int(r['build']))['id'] == reservation_id
 
 
 def update(status):
     row = GitHub().change(lambda ledger: transition(ledger, identity(), status))
     save(reservation_status=row['status'], build=row['build'], reservation_id=row['id'])
     return row
-
-
-def gate(seconds=14400):
-    api = GitHub()
-    deadline = time.monotonic() + seconds
-    interval = 15
-    while time.monotonic() < deadline:
-        ledger, _ = api.load()
-        current = next((x for x in ledger['reservations'] if x['id'] == identity()), None)
-        if not current or current['status'] != 'ready':
-            raise SafeError('Only a ready reservation can enter the submission queue')
-        if is_turn(ledger, identity()):
-            save(queue='submission turn granted')
-            print('Submission turn granted')
-            return
-        earlier = [r for r in ledger['reservations'] if int(r['build']) < int(current['build'])
-                   and r['status'] not in TERMINAL]
-        for row in sorted(earlier, key=lambda r: int(r['build']))[:1]:
-            if row['status'] == 'blocked':
-                raise SafeError('Submission queue blocked by an uncertain earlier upload; use queue recovery after checking Apple')
-            attempt = api.request('GET', f'/actions/runs/{row["run_id"]}/attempts/{row["attempt"]}')
-            if row['status'] == 'uploading' and attempt['status'] == 'completed':
-                raise SafeError('Submission queue blocked by an unfinished upload reservation; use queue recovery after checking Apple')
-            if row['status'] != 'uploading' and attempt['status'] == 'completed':
-                # Only skip a build that never entered the upload stage.
-                def skip_stale(state, identifier=row['id']):
-                    actual = next(r for r in state['reservations'] if r['id'] == identifier)
-                    if actual['status'] in ('building', 'ready'):
-                        transition(state, identifier, 'skipped')
-                api.change(skip_stale)
-        time.sleep(interval)
-        interval = min(300, interval * 2)
-    raise SafeError('Submission queue wait timed out; this reservation has not uploaded')
 
 
 def recover():
@@ -200,22 +160,20 @@ def recover():
         row['recovered_by_run'] = require('GITHUB_RUN_ID')
         return copy.deepcopy(row)
     row = GitHub().change(apply)
-    save(reservation_status=row['status'], build=row['build'], reservation_id=row['id'], queue='manually recovered')
-    print('Reservation recovery recorded; future ready runs may proceed')
+    save(reservation_status=row['status'], build=row['build'], reservation_id=row['id'], recovery='manually reconciled')
+    print('Reservation reconciliation recorded')
 
 
 if __name__ == '__main__':
     import sys
     try:
         command = sys.argv[1]
-        if command == 'gate':
-            gate()
-        elif command == 'recover':
+        if command == 'recover':
             recover()
         else:
             update(command)
     except Exception as error:
         message = str(error) if isinstance(error, SafeError) else 'Reservation operation failed; details suppressed'
-        save(failure=message, queue='not completed')
+        save(failure=message)
         print('ERROR: ' + message, file=sys.stderr)
         sys.exit(1)
