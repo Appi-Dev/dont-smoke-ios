@@ -20,8 +20,6 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
-    outputs:
-      metadata: ${{ steps.reserve.outputs.metadata }}
     env:
       TESTFLIGHT_GROUP_NAME: ${{ vars.TESTFLIGHT_GROUP_NAME }}
     steps:
@@ -58,13 +56,14 @@ jobs:
       contents: write
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-      TF_METADATA: ${{ needs.reserve.outputs.metadata }}
     steps:
       - name: Checkout reserved source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - name: Load reserved build number
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: python3 Scripts/testflight/ci.py initialise_build
       - name: Archive and export signed IPA
         env:
@@ -125,7 +124,7 @@ jobs:
       - name: Queue summary
         if: always()
         env:
-          TF_METADATA: ${{ needs.reserve.outputs.metadata }}
+          GH_TOKEN: ${{ github.token }}
           TF_JOB_STATUS: ${{ job.status }}
         run: |
           python3 Scripts/testflight/ci.py initialise_build
@@ -139,7 +138,6 @@ jobs:
       contents: write
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-      TF_METADATA: ${{ needs.reserve.outputs.metadata }}
     steps:
       - name: Checkout reserved submission code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -152,6 +150,7 @@ jobs:
           path: ${{ runner.temp }}/testflight-poc
       - name: Authenticate IPA and restore reserved metadata
         env:
+          GH_TOKEN: ${{ github.token }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
           ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
         run: python3 Scripts/testflight/ci.py restore

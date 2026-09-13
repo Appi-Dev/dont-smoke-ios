@@ -209,8 +209,10 @@ def prepare():
         from reservations import GitHub, identity, reserve
         github = GitHub()
         github.initialise()
+        configuration = {'app': app, 'group_id': matches[0]['id'], 'group_name': group_name,
+                         'version': VERSION, 'configured_testers': len(rows)}
         reservation = github.change(lambda ledger: reserve(ledger, existing, identity(),
-            require('GITHUB_RUN_ID'), require('GITHUB_RUN_ATTEMPT'), require('GITHUB_SHA')))
+            require('GITHUB_RUN_ID'), require('GITHUB_RUN_ATTEMPT'), require('GITHUB_SHA'), configuration))
         if reservation['status'] != 'building':
             raise SafeError('This attempt already has a reservation; rerun all jobs with a new attempt')
         build = reservation['build']
@@ -219,17 +221,30 @@ def prepare():
         raise SafeError('Persistent GitHub reservation credentials are required')
     save(app=app, group_id=matches[0]['id'], group_name=group_name, build=build,
          configured_testers=len(rows), preparation='passed')
-    metadata = {k: read_state()[k] for k in ('app', 'group_id', 'group_name', 'build', 'version', 'configured_testers', 'reservation_id', 'source_sha', 'preparation')}
-    with open(require('GITHUB_OUTPUT'), 'a') as output:
-        output.write('metadata=' + json.dumps(metadata) + '\n')
     print(f'Configuration validated; marketing version {VERSION}, build {build}')
 
 
+def reserved_metadata():
+    from reservations import GitHub, identity
+    ledger, _ = GitHub().load()
+    row = next((r for r in ledger['reservations'] if r['id'] == identity()), None)
+    if not row or not isinstance(row.get('metadata'), dict):
+        raise SafeError('Reserved metadata is missing; dispatch a new run with the updated workflow')
+    metadata = row['metadata']
+    fields = {'app', 'group_id', 'group_name', 'build', 'version', 'configured_testers',
+              'reservation_id', 'source_sha', 'preparation'}
+    if set(metadata) != fields:
+        raise SafeError('Reserved metadata has an unexpected schema')
+    if (metadata['version'], metadata['source_sha'], metadata['reservation_id'], metadata['build']) != (
+            VERSION, require('GITHUB_SHA'), identity(), row['build']):
+        raise SafeError('Reserved metadata revision, version, attempt or build mismatch')
+    return metadata
+
+
 def initialise_build():
-    metadata = json.loads(require('TF_METADATA'))
-    if metadata['version'] != VERSION or metadata['source_sha'] != require('GITHUB_SHA'):
-        raise SafeError('Build metadata revision or version mismatch')
+    metadata = reserved_metadata()
     save(**metadata)
+
 
 
 def package():
@@ -261,7 +276,7 @@ def restore():
     import hashlib
     import hmac
     import zipfile
-    expected = json.loads(require('TF_METADATA'))
+    expected = reserved_metadata()
     data = (ROOT / 'ipa.bundle').read_bytes()
     if len(data) < 86 or data[:6] != b'TFIPA1':
         raise SafeError('Invalid encrypted IPA bundle')

@@ -31,6 +31,38 @@ class ParallelTests(unittest.TestCase):
         self.assertEqual(self.add(state, '3.1')['build'], '23')
         self.assertEqual(len(state['reservations']), 3)
 
+    def test_reserved_metadata_is_loaded_without_job_outputs(self):
+        state = self.ledger()
+        configuration = {'app': 'fixture', 'group_id': 'fixture-group', 'group_name': 'External QA',
+                         'version': ci.VERSION, 'configured_testers': 1}
+        queue.reserve(state, [], '1.1', '1', '1', 'a' * 40, configuration)
+        api = queue.GitHub()
+        env = {'GITHUB_RUN_ID': '1', 'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_SHA': 'a' * 40,
+               'TF_METADATA': ''}
+        with tempfile.TemporaryDirectory() as directory, patch.object(ci, 'ROOT', Path(directory)), patch.dict(os.environ, env), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'load', return_value=(state, 'sha')):
+            ci.initialise_build()
+            self.assertEqual(ci.read_state()['build'], '21')
+            self.assertEqual(ci.read_state()['source_sha'], 'a' * 40)
+
+    def test_missing_legacy_metadata_fails_with_recovery_guidance(self):
+        state = self.ledger()
+        self.add(state, '1.1')
+        api = queue.GitHub()
+        with patch.dict(os.environ, {'GITHUB_RUN_ID': '1', 'GITHUB_RUN_ATTEMPT': '1'}), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'load', return_value=(state, 'sha')):
+            with self.assertRaises(ci.SafeError) as caught:
+                ci.reserved_metadata()
+            self.assertIn('dispatch a new run', str(caught.exception))
+
+    def test_reserved_metadata_rejects_other_source_revisions(self):
+        state = self.ledger()
+        configuration = {'app': 'fixture', 'group_id': 'fixture-group', 'group_name': 'External QA',
+                         'version': ci.VERSION, 'configured_testers': 1}
+        queue.reserve(state, [], '1.1', '1', '1', 'a' * 40, configuration)
+        api = queue.GitHub()
+        with patch.dict(os.environ, {'GITHUB_RUN_ID': '1', 'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_SHA': 'b' * 40}), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'load', return_value=(state, 'sha')):
+            with self.assertRaises(ci.SafeError):
+                ci.reserved_metadata()
+
     def test_retry_does_not_duplicate_but_new_attempt_reserves_new_number(self):
         state = self.ledger()
         first = self.add(state, '1.1')
@@ -195,14 +227,14 @@ class ParallelTests(unittest.TestCase):
             bundle = (ci.ROOT / 'ipa.bundle').read_bytes()
             self.assertNotIn(b'synthetic-ipa', bundle)
             self.assertNotIn(b'synthetic-key', bundle)
-            with patch.dict(os.environ, {'TF_METADATA': json.dumps(metadata)}):
+            with patch.object(ci, 'reserved_metadata', return_value=metadata):
                 ci.restore()
                 self.assertEqual((ci.ROOT / 'app.ipa').read_bytes(), b'synthetic-ipa')
                 (ci.ROOT / 'ipa.bundle').write_bytes(bundle[:-1] + bytes([bundle[-1] ^ 1]))
                 with self.assertRaises(ci.SafeError):
                     ci.restore()
             (ci.ROOT / 'ipa.bundle').write_bytes(bundle)
-            with patch.dict(os.environ, {'TF_METADATA': json.dumps({**metadata, 'source_sha': 'b' * 40})}):
+            with patch.object(ci, 'reserved_metadata', return_value={**metadata, 'source_sha': 'b' * 40}):
                 with self.assertRaises(ci.SafeError):
                     ci.restore()
 

@@ -102,7 +102,7 @@ def identity():
     return require('GITHUB_RUN_ID') + '.' + require('GITHUB_RUN_ATTEMPT')
 
 
-def reserve(ledger, existing, reservation_id, run_id, attempt, sha):
+def reserve(ledger, existing, reservation_id, run_id, attempt, sha, configuration=None):
     rows = ledger['reservations']
     for row in rows:
         if row['id'] == reservation_id:
@@ -112,6 +112,9 @@ def reserve(ledger, existing, reservation_id, run_id, attempt, sha):
     build = allocate(existing, [row['build'] for row in rows])
     row = {'id': reservation_id, 'build': build, 'version': '9.0.0', 'run_id': run_id,
            'attempt': attempt, 'sha': sha, 'status': 'building'}
+    if configuration is not None:
+        row['metadata'] = {**configuration, 'build': build, 'reservation_id': reservation_id,
+                           'source_sha': sha, 'preparation': 'passed'}
     rows.append(row)
     return copy.deepcopy(row)
 
