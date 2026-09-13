@@ -31,6 +31,15 @@ class ParallelTests(unittest.TestCase):
         self.assertEqual(self.add(state, '3.1')['build'], '23')
         self.assertEqual(len(state['reservations']), 3)
 
+    def test_generated_group_names_are_reserved_atomically(self):
+        state = self.ledger()
+        configuration = {'app': 'fixture', 'group_id': '', 'group_name': '',
+                         'version': ci.VERSION, 'configured_testers': 1}
+        for run, build in (('1', '21'), ('2', '22')):
+            row = queue.reserve(state, [], run + '.1', run, '1', 'a' * 40, configuration)
+            self.assertEqual(row['metadata']['group_name'], f'9.0.0 ({build})')
+            self.assertEqual(row['metadata']['group_id'], '')
+
     def test_reserved_metadata_is_loaded_without_job_outputs(self):
         state = self.ledger()
         configuration = {'app': 'fixture', 'group_id': 'fixture-group', 'group_name': 'External QA',

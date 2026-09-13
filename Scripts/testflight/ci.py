@@ -190,9 +190,6 @@ def prepare():
     ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(ROOT, 0o700)
     save(version=VERSION, preparation='started')
-    group_name = require('TESTFLIGHT_GROUP_NAME')
-    if len(group_name) > 100 or any(ord(c) < 32 for c in group_name) or '@' in group_name:
-        raise SafeError('Use a group name without contact information or control characters')
     rows = testers()
     key_id = require('ASC_KEY_ID')
     if not re.fullmatch(r'[A-Za-z0-9]+', key_id):
@@ -204,10 +201,6 @@ def prepare():
     if len(apps) != 1:
         raise SafeError('Expected exactly one existing App Store Connect app for the repository bundle ID')
     app = apps[0]['id']
-    groups = api.all(f'/v1/apps/{app}/betaGroups')
-    matches = [g for g in groups if g['attributes']['name'] == group_name]
-    if len(matches) != 1 or matches[0]['attributes']['isInternalGroup']:
-        raise SafeError('Configure exactly one existing external TestFlight group for this app')
     builds = api.all('/v1/builds', {'filter[app]': app,
                     'filter[preReleaseVersion.version]': VERSION, 'limit': 200})
     existing = [b['attributes']['version'] for b in builds]
@@ -215,7 +208,7 @@ def prepare():
         from reservations import GitHub, identity, reserve
         github = GitHub()
         github.initialise()
-        configuration = {'app': app, 'group_id': matches[0]['id'], 'group_name': group_name,
+        configuration = {'app': app, 'group_id': '', 'group_name': '',
                          'version': VERSION, 'configured_testers': len(rows)}
         reservation = github.change(lambda ledger: reserve(ledger, existing, identity(),
             require('GITHUB_RUN_ID'), require('GITHUB_RUN_ATTEMPT'), require('GITHUB_SHA'), configuration))
@@ -225,7 +218,7 @@ def prepare():
         save(reservation_id=reservation['id'], source_sha=reservation['sha'])
     else:
         raise SafeError('Persistent GitHub reservation credentials are required')
-    save(app=app, group_id=matches[0]['id'], group_name=group_name, build=build,
+    save(app=app, group_id='', group_name=f'{VERSION} ({build})', build=build,
          configured_testers=len(rows), preparation='passed')
     print(f'Configuration validated; marketing version {VERSION}, build {build}')
 
@@ -433,11 +426,60 @@ def wait_build(api, state, seconds=5400):
     raise SafeError('Apple processing timed out; do not assume the upload failed')
 
 
+def ensure_build_group(api, state):
+    name = f"{VERSION} ({state['build']})"
+    save(group_name=name, group_creation='started')
+
+    def lookup():
+        matches = [g for g in api.all(f"/v1/apps/{state['app']}/betaGroups")
+                   if g['attributes']['name'] == name]
+        if len(matches) > 1:
+            raise SafeError('Ambiguous build group; refusing assignment')
+        if matches:
+            attributes = matches[0]['attributes']
+            if (attributes.get('isInternalGroup') is not False or
+                    attributes.get('publicLinkEnabled') is not False or
+                    attributes.get('hasAccessToAllBuilds') is not False):
+                raise SafeError('Build group must be external, private, and limited to assigned builds')
+            return matches[0]
+        return None
+
+    group = lookup()
+    result = 'reused'
+    if group is None:
+        try:
+            api.request('POST', '/v1/betaGroups', {'data': {
+                'type': 'betaGroups', 'attributes': {
+                    'name': name, 'isInternalGroup': False, 'publicLinkEnabled': False,
+                    'hasAccessToAllBuilds': False},
+                'relationships': {'app': {'data': linkage('apps', state['app'])}}}})
+        except APIError as error:
+            if error.status not in (409, 422):
+                raise
+            result = 'reused after conflict'
+        else:
+            result = 'created'
+        for attempt in range(3):
+            group = lookup()
+            if group is not None:
+                break
+            if attempt < 2:
+                time.sleep(2)
+        if group is None:
+            raise SafeError('Build group creation was not confirmed; reconcile Apple state')
+    linked = api.all(f"/v1/betaGroups/{group['id']}/builds")
+    if any(b['id'] != state['apple_build_id'] for b in linked):
+        raise SafeError('Build group contains a different build; refusing assignment')
+    save(group_id=group['id'], group_creation=result)
+    return group['id']
+
+
 def distribute():
     save(distribution='started')
     api, state = API(), read_state()
     build_id = wait_build(api, state)
-    group_id = state['group_id']
+    state['apple_build_id'] = build_id
+    group_id = ensure_build_group(api, state)
     details = api.request('GET', f'/v1/builds/{build_id}/buildBetaDetail')['data']
     detail_id = details['id']
     api.request('PATCH', f'/v1/buildBetaDetails/{detail_id}', {'data': {
@@ -565,7 +607,7 @@ def summary():
     rows = [('Job', os.environ.get('TF_JOB_STATUS', 'unknown')),
             ('Marketing version', VERSION), ('Build number', state.get('build', 'not assigned'))]
     for label, key in [('Reservation', 'reservation_id'), ('Reservation status', 'reservation_status'), ('Reservation recovery', 'recovery'), ('IPA transfer', 'transfer'), ('Preflight', 'preparation'), ('Archive', 'archive'), ('IPA export', 'export'),
-                       ('Upload', 'upload'), ('Apple processing', 'processing'), ('External group', 'group_name'),
+                       ('Upload', 'upload'), ('Apple processing', 'processing'), ('External group', 'group_name'), ('Group creation', 'group_creation'),
                        ('Group assignment', 'group'), ('Beta App Review', 'beta_review'),
                        ('Distribution', 'distribution'), ('Invitations', 'invitations'),
                        ('Configured testers (unique)', 'configured_testers'), ('Created', 'testers_created'),

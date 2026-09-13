@@ -25,9 +25,12 @@ class FakeAPI:
         self.members = []
         self.builds = []
         self.calls = []
+        self.groups = []
 
     def all(self, path, params=None):
         self.calls.append(('GET', path, params))
+        if path.endswith('/betaGroups'):
+            return self.groups
         if path == '/v1/builds':
             return [{'id': 'build-fixture', 'attributes': {'processingState': 'VALID', 'version': '9000.1.1'}}]
         if path.endswith('/betaBuildLocalizations'):
@@ -50,6 +53,8 @@ class FakeAPI:
             return {'data': self.tester}
         if path.endswith('/buildBetaDetail'):
             return {'data': {'id': 'detail-fixture', 'attributes': {'externalBuildState': self.external, 'autoNotifyEnabled': True}}}
+        if method == 'POST' and path == '/v1/betaGroups':
+            self.groups.append({'id': 'group-fixture', 'attributes': {**body['data']['attributes'], 'hasAccessToAllBuilds': False}})
         if path.endswith('/relationships/builds'):
             self.builds = body['data']
         elif path == '/v1/betaAppReviewSubmissions':
@@ -168,6 +173,61 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(state['testers_existing'], 1)
         self.assertEqual(state['invitations_requested'], 1)
         self.assertEqual(state['testers_verified'], 1)
+
+    def test_build_group_is_created_with_generated_name(self):
+        api = FakeAPI()
+        self.distribute(api)
+        self.assertEqual(api.groups[0]['attributes']['name'], '9.0.0 (9000.1.1)')
+        self.assertFalse(api.groups[0]['attributes']['isInternalGroup'])
+        self.assertFalse(api.groups[0]['attributes']['publicLinkEnabled'])
+        self.assertEqual(ci.read_state()['group_creation'], 'created')
+
+    def test_matching_build_group_is_reused(self):
+        api = FakeAPI()
+        api.groups = [{'id': 'group-fixture', 'attributes': {
+            'name': '9.0.0 (9000.1.1)', 'isInternalGroup': False,
+            'publicLinkEnabled': False, 'hasAccessToAllBuilds': False}}]
+        self.distribute(api)
+        self.assertEqual(ci.read_state()['group_creation'], 'reused')
+        self.assertFalse(any(m == 'POST' and p == '/v1/betaGroups' for m, p, _ in api.calls))
+
+    def test_unsafe_or_ambiguous_groups_are_refused(self):
+        for updates in ({'isInternalGroup': True}, {'publicLinkEnabled': True},
+                        {'hasAccessToAllBuilds': True}, {'duplicate': True}, {'other_build': True}):
+            with self.subTest(updates=updates):
+                api = FakeAPI()
+                group = {'id': 'group-fixture', 'attributes': {
+                    'name': '9.0.0 (9000.1.1)', 'isInternalGroup': False,
+                    'publicLinkEnabled': False, 'hasAccessToAllBuilds': False, **updates}}
+                api.groups = [group, group] if updates.get('duplicate') else [group]
+                api.builds = [{'id': 'other-build'}] if updates.get('other_build') else []
+                with self.assertRaises(ci.SafeError):
+                    self.distribute(api)
+
+    def test_unconfirmed_group_creation_fails_without_assignment(self):
+        api = FakeAPI()
+        original = api.request
+        def request(method, path, body=None, params=None):
+            if method == 'POST' and path == '/v1/betaGroups':
+                return {}
+            return original(method, path, body, params)
+        with patch.object(api, 'request', side_effect=request), patch.object(ci.time, 'sleep'):
+            with self.assertRaises(ci.SafeError):
+                self.distribute(api)
+        self.assertFalse(any(p.endswith('/relationships/builds') for _, p, _ in api.calls))
+
+    def test_group_creation_conflict_is_reconciled_without_retry(self):
+        api = FakeAPI()
+        original = api.request
+        def request(method, path, body=None, params=None):
+            result = original(method, path, body, params)
+            if method == 'POST' and path == '/v1/betaGroups':
+                raise ci.APIError(method, 409)
+            return result
+        with patch.object(api, 'request', side_effect=request):
+            self.distribute(api)
+        self.assertEqual(ci.read_state()['group_creation'], 'reused after conflict')
+        self.assertEqual(sum(m == 'POST' and p == '/v1/betaGroups' for m, p, _ in api.calls), 1)
 
     def test_concurrent_tester_creation_is_reused_without_retry(self):
         api = FakeAPI('IN_BETA_TESTING')

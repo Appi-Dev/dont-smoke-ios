@@ -115,6 +115,8 @@ def reserve(ledger, existing, reservation_id, run_id, attempt, sha, configuratio
     if configuration is not None:
         row['metadata'] = {**configuration, 'build': build, 'reservation_id': reservation_id,
                            'source_sha': sha, 'preparation': 'passed'}
+    if configuration is not None and configuration.get('group_id') == '':
+        row['metadata']['group_name'] = f"9.0.0 ({build})"
     rows.append(row)
     return copy.deepcopy(row)
 
