@@ -20,3 +20,7 @@ The app and calculation-test target have compiled successfully. Simulator test e
 ## Milestone workflow
 
 Keep changes incremental and create a focused commit for each completed milestone. Preserve existing features and tests, record validation results, and exclude build products and local Xcode user settings from commits.
+
+## External TestFlight POC
+
+See [configuration and manual workflow instructions](docs/testflight-poc.md) for signed CI builds of version 9.0.0 and external TestFlight distribution.
