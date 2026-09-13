@@ -166,20 +166,14 @@ def number_tuple(value):
     return tuple(parts + [0] * (3 - len(parts)))
 
 
-def allocate(run_number, attempt, existing):
-    serial = int(run_number) * 100 + int(attempt)
-    if not 1 <= int(attempt) <= 99 or int(run_number) < 1:
-        raise SafeError('Unsupported GitHub run number or attempt')
-    candidate = (9000 + serial // 10000, serial // 100 % 100, serial % 100)
-    if existing:
-        latest = max(number_tuple(x) for x in existing)
-        if candidate <= latest:
-            a, b, c = latest
-            candidate = (a + (b * 100 + c + 1) // 10000,
-                         ((b * 100 + c + 1) // 100) % 100, (c + 1) % 100)
-    if candidate[0] > 9999:
-        raise SafeError('Build number range exhausted')
-    return '.'.join(str(p) for p in candidate)
+def allocate(existing):
+    # Retain the last shared integer build as the starting floor. Include all
+    # uploaded builds, even expired ones, so we never reuse or lower a number.
+    latest = max([number_tuple('20')] + [number_tuple(x) for x in existing])
+    candidate = latest[0] + 1
+    if candidate > 9999:
+        raise SafeError('Integer build number range exhausted')
+    return str(candidate)
 
 
 def prepare():
@@ -206,8 +200,7 @@ def prepare():
         raise SafeError('Configure exactly one existing external TestFlight group for this app')
     builds = api.all('/v1/builds', {'filter[app]': app,
                     'filter[preReleaseVersion.version]': VERSION, 'limit': 200})
-    build = allocate(require('GITHUB_RUN_NUMBER'), require('GITHUB_RUN_ATTEMPT'),
-                     [b['attributes']['version'] for b in builds])
+    build = allocate([b['attributes']['version'] for b in builds])
     save(app=app, group_id=matches[0]['id'], group_name=group_name, build=build,
          configured_testers=len(rows), preparation='passed')
     print(f'Configuration validated; marketing version {VERSION}, build {build}')

@@ -84,15 +84,19 @@ class SafetyTests(unittest.TestCase):
         with patch.object(ci, 'API', return_value=api), contextlib.redirect_stdout(io.StringIO()):
             ci.distribute()
 
-    def test_build_numbers_unique_across_runs_and_attempts(self):
-        values = {ci.allocate(run, attempt, []) for run in range(1, 200) for attempt in range(1, 5)}
-        self.assertEqual(len(values), 199 * 4)
-        self.assertEqual(ci.allocate(1, 1, ['9000.99.99']), '9001.0.0')
-        self.assertGreater(ci.number_tuple(ci.allocate(1, 2, ['9000.1.1'])), (9000, 1, 1))
+    def test_integer_build_numbers_increase_sequentially(self):
+        self.assertEqual(ci.allocate([]), '21')
+        existing = ['20']
+        for expected in ('21', '22', '23'):
+            result = ci.allocate(existing)
+            self.assertEqual(result, expected)
+            existing.append(result)
+        self.assertEqual(ci.allocate(['20', '9000.1.2']), '9001')
+        self.assertEqual(ci.allocate(['23', '21', '22']), '24')
         with self.assertRaises(ci.SafeError):
-            ci.allocate(100000, 1, [])
+            ci.allocate(['9999'])
         with self.assertRaises(ci.SafeError):
-            ci.allocate(1, 100, [])
+            ci.allocate(['invalid'])
 
     def test_testers_validate_and_deduplicate_without_logging_values(self):
         with patch.dict(os.environ, {'TESTFLIGHT_TESTERS_JSON': json.dumps([ROW, ROW])}):
