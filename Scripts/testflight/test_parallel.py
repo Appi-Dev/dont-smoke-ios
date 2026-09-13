@@ -1,0 +1,211 @@
+"""Offline reservation, queue, and encrypted transfer safety tests."""
+import copy
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+# Match script imports without depending on unittest's discovery path setup.
+sys.path.insert(0, str(Path(__file__).parent))
+import ci
+import reservations as queue
+
+
+class ParallelTests(unittest.TestCase):
+    def ledger(self):
+        return {'schema': 1, 'reservations': []}
+
+    def add(self, ledger, identifier, existing=None):
+        return queue.reserve(ledger, existing or [], identifier, identifier.split('.')[0],
+                             identifier.split('.')[1], 'a' * 40)
+
+    def test_reservations_are_unique_before_apple_knows_builds(self):
+        state = self.ledger()
+        self.assertEqual(self.add(state, '1.1')['build'], '21')
+        self.assertEqual(self.add(state, '2.1')['build'], '22')
+        self.assertEqual(self.add(state, '3.1')['build'], '23')
+        self.assertEqual(len(state['reservations']), 3)
+
+    def test_retry_does_not_duplicate_but_new_attempt_reserves_new_number(self):
+        state = self.ledger()
+        first = self.add(state, '1.1')
+        self.assertEqual(self.add(state, '1.1'), first)
+        self.assertEqual(len(state['reservations']), 1)
+        self.assertEqual(self.add(state, '1.2')['build'], '22')
+
+    def test_requested_integer_sequence_is_independent_of_dotted_uploads(self):
+        state = self.ledger()
+        self.assertEqual(self.add(state, '1.1', ['20', '9000.1.2'])['build'], '21')
+        self.assertEqual(self.add(state, '2.1', ['20'])['build'], '22')
+
+    def test_finished_out_of_order_cannot_upload_ahead(self):
+        state = self.ledger()
+        self.add(state, '1.1')
+        self.add(state, '2.1')
+        queue.transition(state, '2.1', 'ready')
+        with self.assertRaises(ci.SafeError):
+            queue.transition(state, '2.1', 'uploading')
+        queue.transition(state, '1.1', 'ready')
+        queue.transition(state, '1.1', 'uploading')
+        with self.assertRaises(ci.SafeError):
+            queue.transition(state, '2.1', 'uploading')
+        queue.transition(state, '1.1', 'completed')
+        queue.transition(state, '2.1', 'uploading')
+
+    def test_upload_claim_cannot_be_replayed(self):
+        state = self.ledger()
+        self.add(state, '1.1')
+        queue.transition(state, '1.1', 'ready')
+        queue.transition(state, '1.1', 'uploading')
+        with self.assertRaises(ci.SafeError):
+            queue.transition(state, '1.1', 'uploading')
+
+    def test_recovery_refuses_a_still_running_originating_attempt(self):
+        state = self.ledger()
+        self.add(state, '1.1')
+        queue.transition(state, '1.1', 'ready')
+        queue.transition(state, '1.1', 'uploading')
+        api = queue.GitHub()
+        env = {'TF_RECOVERY_CONFIRMED': 'true', 'TF_RECOVERY_ID': '1.1',
+               'TF_RECOVERY_RESOLUTION': 'completed', 'GITHUB_RUN_ID': 'recovery'}
+        with patch.dict(os.environ, env), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'change', side_effect=lambda f: f(state)), patch.object(api, 'request', return_value={'status': 'in_progress'}):
+            with self.assertRaises(ci.SafeError):
+                queue.recover()
+        self.assertEqual(state['reservations'][0]['status'], 'uploading')
+
+    def test_recovery_advances_only_after_originating_attempt_has_finished(self):
+        state = self.ledger()
+        self.add(state, '1.1')
+        self.add(state, '2.1')
+        queue.transition(state, '1.1', 'ready')
+        queue.transition(state, '1.1', 'uploading')
+        api = queue.GitHub()
+        env = {'TF_RECOVERY_CONFIRMED': 'true', 'TF_RECOVERY_ID': '1.1',
+               'TF_RECOVERY_RESOLUTION': 'completed', 'GITHUB_RUN_ID': 'recovery'}
+        with patch.dict(os.environ, env), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'change', side_effect=lambda f: f(state)), patch.object(api, 'request', return_value={'status': 'completed'}), patch.object(queue, 'save'):
+            queue.recover()
+        self.assertTrue(queue.is_turn(state, '2.1'))
+        self.assertEqual(state['reservations'][0]['recovered_by_run'], 'recovery')
+
+    def test_failed_build_skips_but_number_is_never_reused(self):
+        state = self.ledger()
+        self.add(state, '1.1')
+        queue.transition(state, '1.1', 'skipped')
+        row = self.add(state, '2.1')
+        self.assertEqual(row['build'], '22')
+        self.assertTrue(queue.is_turn(state, '2.1'))
+
+    def test_uncertain_upload_cannot_be_automatically_skipped(self):
+        state = self.ledger()
+        self.add(state, '1.1')
+        self.add(state, '2.1')
+        queue.transition(state, '1.1', 'ready')
+        queue.transition(state, '1.1', 'uploading')
+        queue.transition(state, '1.1', 'blocked')
+        with self.assertRaises(ci.SafeError):
+            queue.transition(state, '1.1', 'skipped')
+        self.assertFalse(queue.is_turn(state, '2.1'))
+
+    def test_compare_and_swap_retries_against_updated_remote_ledger(self):
+        state = self.ledger()
+        api = queue.GitHub()
+        fresh = self.ledger()
+        self.add(fresh, 'other.1')
+        loads = [(state, 'old-sha'), (fresh, 'new-sha')]
+        bodies = []
+        def request(method, path, body):
+            bodies.append(body)
+            if len(bodies) == 1:
+                raise queue.Conflict(409)
+            return {}
+        with patch.object(api, 'load', side_effect=loads), patch.object(api, 'request', side_effect=request), patch.object(queue.time, 'sleep'):
+            result = api.change(lambda ledger: self.add(ledger, '2.1'))
+        self.assertEqual(result['build'], '22')
+        self.assertEqual(bodies[1]['sha'], 'new-sha')
+
+    def test_missing_branch_requires_explicit_first_setup(self):
+        api = queue.GitHub()
+        with patch.dict(os.environ, {'TF_INITIALIZE_STATE': 'false'}), patch.object(api, 'request', side_effect=queue.Conflict(404)) as request:
+            with self.assertRaises(ci.SafeError):
+                api.initialise()
+        self.assertEqual(request.call_count, 1)
+
+    def test_missing_ledger_never_silently_resets_counter(self):
+        api = queue.GitHub()
+        with patch.object(api, 'request', side_effect=queue.Conflict(404)):
+            with self.assertRaises(ci.SafeError):
+                api.load()
+
+    def test_gate_skips_cancelled_preupload_attempt(self):
+        state = self.ledger()
+        self.add(state, '1.1')
+        self.add(state, '2.1')
+        queue.transition(state, '2.1', 'ready')
+        api = queue.GitHub()
+        with patch.dict(os.environ, {'GITHUB_RUN_ID': '2', 'GITHUB_RUN_ATTEMPT': '1'}), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'load', side_effect=lambda: (state, 'sha')), patch.object(api, 'request', return_value={'status': 'completed'}), patch.object(api, 'change', side_effect=lambda f: f(state)), patch.object(queue.time, 'sleep'), patch.object(queue, 'save'):
+            queue.gate(seconds=10)
+        self.assertEqual(state['reservations'][0]['status'], 'skipped')
+
+    def test_gate_reports_blocked_upload_without_waiting_forever(self):
+        state = self.ledger()
+        self.add(state, '1.1')
+        self.add(state, '2.1')
+        queue.transition(state, '1.1', 'ready')
+        queue.transition(state, '1.1', 'uploading')
+        queue.transition(state, '2.1', 'ready')
+        api = queue.GitHub()
+        with patch.dict(os.environ, {'GITHUB_RUN_ID': '2', 'GITHUB_RUN_ATTEMPT': '1'}), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'load', return_value=(state, 'sha')), patch.object(api, 'request', return_value={'status': 'completed'}):
+            with self.assertRaises(ci.SafeError):
+                queue.gate(seconds=10)
+
+    def test_gate_waits_for_a_normally_running_upload(self):
+        state = self.ledger()
+        self.add(state, '1.1')
+        self.add(state, '2.1')
+        queue.transition(state, '1.1', 'ready')
+        queue.transition(state, '1.1', 'uploading')
+        queue.transition(state, '2.1', 'ready')
+        api = queue.GitHub()
+        def complete(_):
+            queue.transition(state, '1.1', 'completed')
+        with patch.dict(os.environ, {'GITHUB_RUN_ID': '2', 'GITHUB_RUN_ATTEMPT': '1'}), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'load', side_effect=lambda: (state, 'sha')), patch.object(api, 'request', return_value={'status': 'in_progress'}), patch.object(queue.time, 'sleep', side_effect=complete), patch.object(queue, 'save'):
+            queue.gate(seconds=10)
+        self.assertTrue(queue.is_turn(state, '2.1'))
+
+    def test_recovery_requires_apple_confirmation(self):
+        with patch.dict(os.environ, {'TF_RECOVERY_CONFIRMED': 'false'}):
+            with self.assertRaises(ci.SafeError):
+                queue.recover()
+
+    def test_encrypted_transfer_round_trip_tampering_and_revision_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(ci, 'ROOT', Path(directory)), patch.dict(os.environ, {
+            'KEYCHAIN_PASSWORD': 'synthetic-test-password', 'ASC_PRIVATE_KEY': 'synthetic-key'}):
+            metadata = {'app': 'fixture', 'group_id': 'fixture-group', 'group_name': 'External QA',
+                        'build': '21', 'version': '9.0.0', 'configured_testers': 1,
+                        'reservation_id': '1.1', 'source_sha': 'a' * 40, 'preparation': 'passed'}
+            ipa = Path(directory) / 'fixture.ipa'
+            ipa.write_bytes(b'synthetic-ipa')
+            ci.save(**metadata, archive='succeeded', export='succeeded', ipa=str(ipa))
+            ci.package()
+            bundle = (ci.ROOT / 'ipa.bundle').read_bytes()
+            self.assertNotIn(b'synthetic-ipa', bundle)
+            self.assertNotIn(b'synthetic-key', bundle)
+            with patch.dict(os.environ, {'TF_METADATA': json.dumps(metadata)}):
+                ci.restore()
+                self.assertEqual((ci.ROOT / 'app.ipa').read_bytes(), b'synthetic-ipa')
+                (ci.ROOT / 'ipa.bundle').write_bytes(bundle[:-1] + bytes([bundle[-1] ^ 1]))
+                with self.assertRaises(ci.SafeError):
+                    ci.restore()
+            (ci.ROOT / 'ipa.bundle').write_bytes(bundle)
+            with patch.dict(os.environ, {'TF_METADATA': json.dumps({**metadata, 'source_sha': 'b' * 40})}):
+                with self.assertRaises(ci.SafeError):
+                    ci.restore()
+
+
+if __name__ == '__main__':
+    unittest.main()

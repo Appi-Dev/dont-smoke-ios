@@ -23,4 +23,4 @@ Keep changes incremental and create a focused commit for each completed mileston
 
 ## External TestFlight POC
 
-See [configuration and manual workflow instructions](docs/testflight-poc.md) for signed CI builds of version 9.0.0 and external TestFlight distribution.
+See [configuration and manual workflow instructions](docs/testflight-poc.md) for parallel signed CI builds of version 9.0.0, persistent build-number reservations, ordered external TestFlight distribution, and queue recovery.

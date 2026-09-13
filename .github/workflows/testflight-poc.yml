@@ -2,40 +2,70 @@ name: External TestFlight POC
 
 on:
   workflow_dispatch:
+    inputs:
+      initialize_state:
+        description: First parallel run only - create the ledger after confirming no existing reservations or older runs
+        type: boolean
+        default: false
+        required: true
 
 permissions:
   contents: read
 
-concurrency:
-  group: external-testflight-poc
-  cancel-in-progress: false
-
+# No workflow-wide lock: each run builds on its own hosted Mac.
 jobs:
-  distribute:
-    # Signing secrets must only be available to trusted code on the default branch.
+  reserve:
     if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    runs-on: macos-26
-    timeout-minutes: 210
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      metadata: ${{ steps.reserve.outputs.metadata }}
     env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
       TESTFLIGHT_GROUP_NAME: ${{ vars.TESTFLIGHT_GROUP_NAME }}
     steps:
-      - name: Checkout
+      - name: Checkout trusted source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-
-      - name: Offline distribution safety tests
+      - name: Offline safety tests
         run: python3 -m unittest discover -s Scripts/testflight -p 'test_*.py'
-
-      - name: Validate configuration and reserve build number
+      - name: Validate Apple configuration and persist a unique reservation
+        id: reserve
         env:
+          GH_TOKEN: ${{ github.token }}
+          TF_INITIALIZE_STATE: ${{ inputs.initialize_state }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
           TESTFLIGHT_TESTERS_JSON: ${{ secrets.TESTFLIGHT_TESTERS_JSON }}
         run: python3 Scripts/testflight/ci.py prepare
+      - name: Delete temporary API credentials
+        if: always()
+        run: python3 Scripts/testflight/ci.py cleanup
+      - name: Reservation summary
+        if: always()
+        env:
+          TF_JOB_STATUS: ${{ job.status }}
+        run: python3 Scripts/testflight/ci.py summary
 
+  build:
+    needs: reserve
+    runs-on: macos-26
+    timeout-minutes: 70
+    permissions:
+      contents: write
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      TF_METADATA: ${{ needs.reserve.outputs.metadata }}
+    steps:
+      - name: Checkout reserved source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Load reserved build number
+        run: python3 Scripts/testflight/ci.py initialise_build
       - name: Archive and export signed IPA
         env:
           BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
@@ -43,24 +73,119 @@ jobs:
           PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: python3 Scripts/testflight/ci.py build
+      - name: Encrypt and authenticate IPA transfer
+        env:
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: python3 Scripts/testflight/ci.py package
+      - name: Store encrypted IPA for submission
+        id: artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: testflight-ipa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/testflight-poc/ipa.bundle
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Mark reservation ready or skip a failed build
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TF_ARTIFACT_OUTCOME: ${{ steps.artifact.outcome }}
+        run: |
+          if [ "$TF_ARTIFACT_OUTCOME" = "success" ]; then
+            python3 Scripts/testflight/reservations.py ready
+          else
+            python3 Scripts/testflight/reservations.py skipped
+          fi
+      - name: Remove temporary signing credentials and plaintext IPA
+        if: always()
+        run: python3 Scripts/testflight/ci.py cleanup
+      - name: Build summary
+        if: always()
+        env:
+          TF_JOB_STATUS: ${{ job.status }}
+        run: python3 Scripts/testflight/ci.py summary
 
+  submission_turn:
+    needs: [reserve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 245
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout trusted queue code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Wait for lower reserved builds without occupying a Mac
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 Scripts/testflight/reservations.py gate
+      - name: Queue summary
+        if: always()
+        env:
+          TF_METADATA: ${{ needs.reserve.outputs.metadata }}
+          TF_JOB_STATUS: ${{ job.status }}
+        run: |
+          python3 Scripts/testflight/ci.py initialise_build
+          python3 Scripts/testflight/ci.py summary
+
+  submit:
+    needs: [reserve, submission_turn]
+    runs-on: macos-26
+    timeout-minutes: 135
+    permissions:
+      contents: write
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      TF_METADATA: ${{ needs.reserve.outputs.metadata }}
+    steps:
+      - name: Checkout reserved submission code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Download this attempt's encrypted IPA
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: testflight-ipa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/testflight-poc
+      - name: Authenticate IPA and restore reserved metadata
+        env:
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        run: python3 Scripts/testflight/ci.py restore
+      - name: Atomically claim the next submission before contacting Apple
+        id: claim
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 Scripts/testflight/reservations.py uploading
       - name: Upload IPA
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: python3 Scripts/testflight/ci.py upload
-
-      - name: Wait for processing and configure external distribution
+      - name: Wait for processing and configure external TestFlight
+        id: distribute
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           TESTFLIGHT_TESTERS_JSON: ${{ secrets.TESTFLIGHT_TESTERS_JSON }}
         run: python3 Scripts/testflight/ci.py distribute
-
-      - name: Remove temporary signing and API credentials
+      - name: Complete reservation or block an uncertain submission
+        if: always() && steps.claim.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TF_DISTRIBUTE_OUTCOME: ${{ steps.distribute.outcome }}
+        run: |
+          if [ "$TF_DISTRIBUTE_OUTCOME" = "success" ]; then
+            python3 Scripts/testflight/reservations.py completed
+          else
+            python3 Scripts/testflight/reservations.py blocked
+          fi
+      - name: Delete decrypted IPA and API credentials
         if: always()
         run: python3 Scripts/testflight/ci.py cleanup
-
       - name: Distribution summary
         if: always()
         env:

@@ -86,15 +86,15 @@ class SafetyTests(unittest.TestCase):
 
     def test_integer_build_numbers_increase_sequentially(self):
         self.assertEqual(ci.allocate([]), '21')
-        existing = ['20']
+        reserved = []
         for expected in ('21', '22', '23'):
-            result = ci.allocate(existing)
+            result = ci.allocate(['20', '9000.1.2'], reserved)
             self.assertEqual(result, expected)
-            existing.append(result)
-        self.assertEqual(ci.allocate(['20', '9000.1.2']), '9001')
-        self.assertEqual(ci.allocate(['23', '21', '22']), '24')
+            reserved.append(result)
+        self.assertEqual(ci.allocate(['21', '21.0', '22', '9001']), '23')
+        self.assertEqual(ci.allocate([], ['23', '21', '22']), '24')
         with self.assertRaises(ci.SafeError):
-            ci.allocate(['9999'])
+            ci.allocate([], ['9999'])
         with self.assertRaises(ci.SafeError):
             ci.allocate(['invalid'])
 

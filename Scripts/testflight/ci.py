@@ -166,11 +166,15 @@ def number_tuple(value):
     return tuple(parts + [0] * (3 - len(parts)))
 
 
-def allocate(existing):
-    # Retain the last shared integer build as the starting floor. Include all
-    # uploaded builds, even expired ones, so we never reuse or lower a number.
-    latest = max([number_tuple('20')] + [number_tuple(x) for x in existing])
-    candidate = latest[0] + 1
+def allocate(existing, reserved=()):
+    # Owner-requested integer sequence, independent of the earlier dotted
+    # sequence. Apple still validates whether it accepts a lower build number.
+    for value in existing:
+        number_tuple(value)
+    candidate = max([20] + [int(value) for value in reserved]) + 1
+    uploaded = {number_tuple(value) for value in existing}
+    while number_tuple(str(candidate)) in uploaded:
+        candidate += 1
     if candidate > 9999:
         raise SafeError('Integer build number range exhausted')
     return str(candidate)
@@ -200,10 +204,87 @@ def prepare():
         raise SafeError('Configure exactly one existing external TestFlight group for this app')
     builds = api.all('/v1/builds', {'filter[app]': app,
                     'filter[preReleaseVersion.version]': VERSION, 'limit': 200})
-    build = allocate([b['attributes']['version'] for b in builds])
+    existing = [b['attributes']['version'] for b in builds]
+    if os.environ.get('GH_TOKEN'):
+        from reservations import GitHub, identity, reserve
+        github = GitHub()
+        github.initialise()
+        reservation = github.change(lambda ledger: reserve(ledger, existing, identity(),
+            require('GITHUB_RUN_ID'), require('GITHUB_RUN_ATTEMPT'), require('GITHUB_SHA')))
+        if reservation['status'] != 'building':
+            raise SafeError('This attempt already has a reservation; rerun all jobs with a new attempt')
+        build = reservation['build']
+        save(reservation_id=reservation['id'], source_sha=reservation['sha'])
+    else:
+        raise SafeError('Persistent GitHub reservation credentials are required')
     save(app=app, group_id=matches[0]['id'], group_name=group_name, build=build,
          configured_testers=len(rows), preparation='passed')
+    metadata = {k: read_state()[k] for k in ('app', 'group_id', 'group_name', 'build', 'version', 'configured_testers', 'reservation_id', 'source_sha', 'preparation')}
+    with open(require('GITHUB_OUTPUT'), 'a') as output:
+        output.write('metadata=' + json.dumps(metadata) + '\n')
     print(f'Configuration validated; marketing version {VERSION}, build {build}')
+
+
+def initialise_build():
+    metadata = json.loads(require('TF_METADATA'))
+    if metadata['version'] != VERSION or metadata['source_sha'] != require('GITHUB_SHA'):
+        raise SafeError('Build metadata revision or version mismatch')
+    save(**metadata)
+
+
+def package():
+    # Encrypt and authenticate only the IPA and sanitized build metadata.
+    import hashlib
+    import hmac
+    import zipfile
+    state = read_state()
+    metadata = {k: state[k] for k in ('app', 'group_id', 'group_name', 'build', 'version',
+        'configured_testers', 'reservation_id', 'source_sha', 'preparation', 'archive', 'export')}
+    metadata['ipa_sha256'] = hashlib.sha256(Path(state['ipa']).read_bytes()).hexdigest()
+    plain = ROOT / 'transfer.zip'
+    with zipfile.ZipFile(plain, 'w', zipfile.ZIP_STORED) as archive:
+        archive.writestr('metadata.json', json.dumps(metadata))
+        archive.write(state['ipa'], 'app.ipa')
+    require('KEYCHAIN_PASSWORD')
+    cipher = ROOT / 'transfer.enc'
+    run(['openssl', 'enc', '-aes-256-cbc', '-pbkdf2', '-iter', '200000', '-salt',
+         '-pass', 'env:KEYCHAIN_PASSWORD', '-in', str(plain), '-out', str(cipher)], timeout=300)
+    salt = os.urandom(32)
+    key = hashlib.pbkdf2_hmac('sha256', require('KEYCHAIN_PASSWORD').encode(), salt, 200000)
+    ciphertext = cipher.read_bytes()
+    tag = hmac.new(key, b'TFIPA1' + salt + ciphertext, hashlib.sha256).digest()
+    (ROOT / 'ipa.bundle').write_bytes(b'TFIPA1' + salt + tag + ciphertext)
+    save(transfer='encrypted and authenticated')
+
+
+def restore():
+    import hashlib
+    import hmac
+    import zipfile
+    expected = json.loads(require('TF_METADATA'))
+    data = (ROOT / 'ipa.bundle').read_bytes()
+    if len(data) < 86 or data[:6] != b'TFIPA1':
+        raise SafeError('Invalid encrypted IPA bundle')
+    salt, tag, ciphertext = data[6:38], data[38:70], data[70:]
+    key = hashlib.pbkdf2_hmac('sha256', require('KEYCHAIN_PASSWORD').encode(), salt, 200000)
+    if not hmac.compare_digest(tag, hmac.new(key, b'TFIPA1' + salt + ciphertext, hashlib.sha256).digest()):
+        raise SafeError('IPA bundle authentication failed')
+    (ROOT / 'transfer.enc').write_bytes(ciphertext)
+    run(['openssl', 'enc', '-d', '-aes-256-cbc', '-pbkdf2', '-iter', '200000',
+         '-pass', 'env:KEYCHAIN_PASSWORD', '-in', str(ROOT / 'transfer.enc'),
+         '-out', str(ROOT / 'transfer.zip')], timeout=300)
+    with zipfile.ZipFile(ROOT / 'transfer.zip') as archive:
+        if sorted(archive.namelist()) != ['app.ipa', 'metadata.json']:
+            raise SafeError('Unexpected IPA bundle contents')
+        metadata = json.loads(archive.read('metadata.json'))
+        if set(metadata) != set(expected) | {'archive', 'export', 'ipa_sha256'} or any(metadata.get(k) != v for k, v in expected.items()):
+            raise SafeError('IPA bundle differs from the reserved build metadata')
+        ipa = archive.read('app.ipa')
+        if hashlib.sha256(ipa).hexdigest() != metadata['ipa_sha256']:
+            raise SafeError('IPA checksum verification failed')
+        (ROOT / 'app.ipa').write_bytes(ipa)
+    save(**metadata, ipa=str(ROOT / 'app.ipa'), transfer='verified and decrypted')
+    (ROOT / 'AuthKey.p8').write_text(require('ASC_PRIVATE_KEY'))
 
 
 def signing_profile(profile):
@@ -429,7 +510,7 @@ def summary():
     state = read_state()
     rows = [('Job', os.environ.get('TF_JOB_STATUS', 'unknown')),
             ('Marketing version', VERSION), ('Build number', state.get('build', 'not assigned'))]
-    for label, key in [('Preflight', 'preparation'), ('Archive', 'archive'), ('IPA export', 'export'),
+    for label, key in [('Reservation', 'reservation_id'), ('Reservation status', 'reservation_status'), ('Submission queue', 'queue'), ('IPA transfer', 'transfer'), ('Preflight', 'preparation'), ('Archive', 'archive'), ('IPA export', 'export'),
                        ('Upload', 'upload'), ('Apple processing', 'processing'), ('External group', 'group_name'),
                        ('Group assignment', 'group'), ('Beta App Review', 'beta_review'),
                        ('Distribution', 'distribution'), ('Invitations', 'invitations'),
@@ -475,7 +556,7 @@ def cleanup():
 
 if __name__ == '__main__':
     os.umask(0o077)
-    commands = {f.__name__: f for f in (prepare, build, upload, distribute, summary, cleanup)}
+    commands = {f.__name__: f for f in (prepare, initialise_build, build, package, restore, upload, distribute, summary, cleanup)}
     try:
         commands[sys.argv[1]]()
     except Exception as error:
