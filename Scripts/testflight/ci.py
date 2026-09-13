@@ -437,10 +437,16 @@ def ensure_build_group(api, state):
             raise SafeError('Ambiguous build group; refusing assignment')
         if matches:
             attributes = matches[0]['attributes']
-            if (attributes.get('isInternalGroup') is not False or
-                    attributes.get('publicLinkEnabled') is not False or
-                    attributes.get('hasAccessToAllBuilds') is not False):
-                raise SafeError('Build group must be external, private, and limited to assigned builds')
+            if attributes.get('isInternalGroup') is not False:
+                raise SafeError('Build group is not confirmed external')
+            # Nullable flags are not enabled flags. Still reject absent fields,
+            # unexpected types, and any public-link evidence when status is null.
+            for field in ('publicLinkEnabled', 'hasAccessToAllBuilds'):
+                if field not in attributes or (attributes[field] is not False and attributes[field] is not None):
+                    raise SafeError(f'Build group safety check failed: {field} must be false or null')
+            if attributes['publicLinkEnabled'] is None and (
+                    attributes.get('publicLink') or attributes.get('publicLinkId')):
+                raise SafeError('Build group has an unconfirmed public link; refusing assignment')
             return matches[0]
         return None
 

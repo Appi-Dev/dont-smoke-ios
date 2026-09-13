@@ -191,9 +191,35 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(ci.read_state()['group_creation'], 'reused')
         self.assertFalse(any(m == 'POST' and p == '/v1/betaGroups' for m, p, _ in api.calls))
 
+    def test_nullable_external_group_flags_allow_tester_assignment(self):
+        for public, all_builds in ((False, None), (None, False), (None, None)):
+            with self.subTest(public=public, all_builds=all_builds):
+                api = FakeAPI(existing=True)
+                api.groups = [{'id': 'group-fixture', 'attributes': {
+                    'name': '9.0.0 (9000.1.1)', 'isInternalGroup': False,
+                    'publicLinkEnabled': public, 'hasAccessToAllBuilds': all_builds,
+                    'publicLink': None, 'publicLinkId': None}}]
+                self.distribute(api)
+                self.assertEqual(ci.read_state()['testers_added'], 1)
+                self.assertEqual(ci.read_state()['testers_verified'], 1)
+
+    def test_missing_safety_flags_fail_closed(self):
+        for field in ('isInternalGroup', 'publicLinkEnabled', 'hasAccessToAllBuilds'):
+            with self.subTest(field=field):
+                api = FakeAPI()
+                attributes = {'name': '9.0.0 (9000.1.1)', 'isInternalGroup': False,
+                              'publicLinkEnabled': False, 'hasAccessToAllBuilds': False}
+                del attributes[field]
+                api.groups = [{'id': 'group-fixture', 'attributes': attributes}]
+                with self.assertRaises(ci.SafeError):
+                    self.distribute(api)
+
     def test_unsafe_or_ambiguous_groups_are_refused(self):
         for updates in ({'isInternalGroup': True}, {'publicLinkEnabled': True},
-                        {'hasAccessToAllBuilds': True}, {'duplicate': True}, {'other_build': True}):
+                        {'hasAccessToAllBuilds': True}, {'duplicate': True}, {'other_build': True},
+                        {'publicLinkEnabled': None, 'publicLink': 'synthetic-link'},
+                        {'publicLinkEnabled': None, 'publicLinkId': 'synthetic-id'},
+                        {'publicLinkEnabled': 'false'}, {'isInternalGroup': None}):
             with self.subTest(updates=updates):
                 api = FakeAPI()
                 group = {'id': 'group-fixture', 'attributes': {
