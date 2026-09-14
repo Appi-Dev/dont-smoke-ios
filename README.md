@@ -24,3 +24,5 @@ Keep changes incremental and create a focused commit for each completed mileston
 ## External TestFlight POC
 
 See [configuration and manual workflow instructions](docs/testflight-poc.md) for parallel signed CI builds of version 9.0.0, persistent build-number reservations, independent external TestFlight distribution with a group per build, and reservation recovery.
+
+A separate manual [9.0.1 TestFlight experiment](.github/workflows/testflight-poc-9-0-1.yml) uses the same app and shared build-number ledger to test upload acceptance under another marketing version. It does not submit a production release.

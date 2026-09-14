@@ -19,7 +19,6 @@ import uuid
 
 BUNDLE = 'com.arpitdixit.dontsmoke'
 TEAM = 'FCX2BY8WSZ'
-VERSION = '9.0.0'
 ROOT = Path(os.environ.get('TF_DIR', str(Path(os.environ.get('RUNNER_TEMP', '/tmp')) / 'testflight-poc')))
 BASE = 'https://api.appstoreconnect.apple.com'
 
@@ -27,11 +26,27 @@ BASE = 'https://api.appstoreconnect.apple.com'
 class SafeError(Exception):
     """Only deliberately sanitized messages may be printed."""
 
+def configured_version():
+    value = os.environ.get('TF_VERSION', '9.0.0')
+    if value not in ('9.0.0', '9.0.1'):
+        raise SafeError('TF_VERSION must be 9.0.0 or 9.0.1')
+    return value
+
+
+VERSION = configured_version()
+
+
 class APIError(SafeError):
     def __init__(self, method, status):
         self.status = status
         super().__init__(f'App Store Connect {method} failed (HTTP {status}); details suppressed')
 
+
+
+class ToolError(SafeError):
+    def __init__(self, message, codes):
+        super().__init__(message)
+        self.codes = codes
 
 
 def require(name):
@@ -58,7 +73,7 @@ def run(args, *, data=None, timeout=120, combined=False, report_apple_codes=Fals
     if result.returncode:
         codes = apple_error_codes(result.stdout + b'\n' + result.stderr) if report_apple_codes else []
         detail = '; Apple error codes: ' + ', '.join(codes) if codes else ''
-        raise SafeError(f'{Path(args[0]).name} failed (exit {result.returncode}){detail}; raw output suppressed')
+        raise ToolError(f'{Path(args[0]).name} failed (exit {result.returncode}){detail}; raw output suppressed', codes)
     return result.stdout + result.stderr if combined else result.stdout
 
 
@@ -406,7 +421,7 @@ def upload():
              '--api-key', require('ASC_KEY_ID'), '--api-issuer', require('ASC_ISSUER_ID')],
              timeout=1800, combined=True, report_apple_codes=True)
     except SafeError as error:
-        save(upload='failed; ' + str(error))
+        save(upload='failed; ' + str(error), upload_error_codes=', '.join(getattr(error, 'codes', [])))
         raise
     except subprocess.TimeoutExpired:
         save(upload='timed out; Apple may have received the build')
@@ -418,9 +433,47 @@ def upload():
     print('Upload tool completed; Apple processing will confirm the exact build')
 
 
+def check_build_upload(api, state):
+    try:
+        uploads = api.all(f"/v1/apps/{state['app']}/buildUploads", {
+            'filter[cfBundleShortVersionString]': VERSION,
+            'filter[cfBundleVersion]': state['build'], 'filter[platform]': 'IOS', 'limit': 200})
+    except SafeError:
+        save(upload_processing='status lookup failed; details suppressed')
+        raise
+    if len(uploads) > 1:
+        raise SafeError('Build upload lookup is ambiguous; reconcile Apple state')
+    if not uploads:
+        save(upload_processing='not yet visible')
+        return
+    attributes = uploads[0]['attributes']
+    if (attributes.get('cfBundleShortVersionString'), attributes.get('cfBundleVersion'),
+            attributes.get('platform')) != (VERSION, state['build'], 'IOS'):
+        raise SafeError('Build upload version, build or platform mismatch')
+    delivery = attributes.get('state')
+    if not isinstance(delivery, dict) or delivery.get('state') not in (
+            'AWAITING_UPLOAD', 'PROCESSING', 'FAILED', 'COMPLETE'):
+        raise SafeError('Unknown build upload state; reconcile Apple state')
+    status = delivery['state']
+    save(upload_processing=status)
+    if status == 'FAILED':
+        # Read only explicitly structured codes, never error descriptions.
+        codes = set()
+        for error in delivery.get('errors') or []:
+            value = error.get('code') if isinstance(error, dict) else None
+            if isinstance(value, str):
+                match = re.fullmatch(r'(?:ITMS-)?([0-9]{5})', value, re.IGNORECASE)
+                if match:
+                    codes.add(match[1])
+        detail = '; Apple error codes: ' + ', '.join(sorted(codes)[:10]) if codes else ''
+        save(processing='FAILED' + detail, processing_error_codes=', '.join(sorted(codes)[:10]) or 'not provided')
+        raise SafeError('Apple rejected build during upload processing' + detail + '; raw details suppressed')
+
+
 def wait_build(api, state, seconds=5400):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
+        check_build_upload(api, state)
         builds = api.all('/v1/builds', {'filter[app]': state['app'],
                  'filter[version]': state['build'], 'filter[preReleaseVersion.version]': VERSION})
         if len(builds) > 1:
@@ -628,14 +681,50 @@ def distribute():
     print('External group and tester membership verified; see summary for Apple review status')
 
 
+def fallback():
+    state = read_state()
+    codes = {value.strip() for key in ('upload_error_codes', 'processing_error_codes')
+             for value in state.get(key, '').split(',')}
+    if VERSION != '9.0.0' or '90382' not in codes:
+        save(fallback='not requested; no eligible 9.0.0 upload-limit failure')
+        return
+    from reservations import GitHub, identity
+    api = GitHub()
+    def claim(ledger):
+        row = next((r for r in ledger['reservations'] if r['id'] == identity()), None)
+        if not row or row['version'] != '9.0.0' or row['sha'] != require('GITHUB_SHA'):
+            raise SafeError('Fallback reservation identity mismatch')
+        if row.get('fallback'):
+            return False
+        row['fallback'] = {'version': '9.0.1', 'status': 'dispatch claimed'}
+        return True
+    if not api.change(claim):
+        save(fallback='already claimed; no duplicate dispatch')
+        return
+    save(fallback='9.0.1 dispatch claimed')
+    try:
+        api.request('POST', '/actions/workflows/testflight-poc-9-0-1.yml/dispatches', {
+            'ref': require('GITHUB_REF_NAME'), 'inputs': {'initialize_state': False}})
+    except Exception:
+        save(fallback='9.0.1 dispatch failed or uncertain; check Actions before manual retry')
+        raise SafeError('Fallback dispatch failed or uncertain; not automatically retried') from None
+    def confirm(ledger):
+        row = next(r for r in ledger['reservations'] if r['id'] == identity())
+        row['fallback']['status'] = 'dispatch accepted'
+    api.change(confirm)
+    save(fallback='9.0.1 workflow dispatch accepted; see repository Actions runs')
+    print('One-way 9.0.1 fallback dispatch accepted')
+
+
 def summary():
     state = read_state()
     rows = [('Job', os.environ.get('TF_JOB_STATUS', 'unknown')),
             ('Marketing version', VERSION), ('Build number', state.get('build', 'not assigned'))]
     for label, key in [('Reservation', 'reservation_id'), ('Reservation status', 'reservation_status'), ('Reservation recovery', 'recovery'), ('IPA transfer', 'transfer'), ('Preflight', 'preparation'), ('Archive', 'archive'), ('IPA export', 'export'),
-                       ('Upload', 'upload'), ('Apple processing', 'processing'), ('External group', 'group_name'), ('Group creation', 'group_creation'),
+                       ('Upload', 'upload'), ('Build Uploads processing', 'upload_processing'),
+                       ('Processing error codes', 'processing_error_codes'), ('Apple processing', 'processing'), ('External group', 'group_name'), ('Group creation', 'group_creation'),
                        ('Group assignment', 'group'), ('Beta App Review', 'beta_review'),
-                       ('Distribution', 'distribution'), ('Invitations', 'invitations'),
+                       ('Distribution', 'distribution'), ('9.0.1 fallback', 'fallback'), ('Invitations', 'invitations'),
                        ('Configured testers (unique)', 'configured_testers'), ('Created', 'testers_created'),
                        ('Existing', 'testers_existing'), ('Added to group', 'testers_added'),
                        ('Memberships verified', 'testers_verified'), ('Explicit invitation requests', 'invitations_requested'),
@@ -678,12 +767,12 @@ def cleanup():
 
 if __name__ == '__main__':
     os.umask(0o077)
-    commands = {f.__name__: f for f in (prepare, initialise_build, build, package, restore, upload, distribute, summary, cleanup)}
+    commands = {f.__name__: f for f in (prepare, initialise_build, build, package, restore, upload, distribute, fallback, summary, cleanup)}
     try:
         commands[sys.argv[1]]()
     except Exception as error:
         message = str(error) if isinstance(error, SafeError) else 'Operation failed; sensitive diagnostic details suppressed'
-        if sys.argv[1] not in ('cleanup', 'summary'):
+        if sys.argv[1] not in ('cleanup', 'summary', 'fallback'):
             save(failure=message)
         print('ERROR: ' + sys.argv[1] + ': ' + message, file=sys.stderr)
         sys.exit(1)

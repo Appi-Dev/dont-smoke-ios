@@ -1,16 +1,16 @@
-name: External TestFlight POC
+name: External TestFlight POC 9.0.1
 
 on:
   workflow_dispatch:
     inputs:
       initialize_state:
-        description: First parallel run only - create the ledger after confirming no existing reservations or older runs
+        description: First setup only - existing QA ledger is shared; leave false if already created
         type: boolean
         default: false
         required: true
 
 env:
-  TF_VERSION: '9.0.0'
+  TF_VERSION: '9.0.1'
 
 permissions:
   contents: read
@@ -114,7 +114,6 @@ jobs:
     timeout-minutes: 135
     permissions:
       contents: write
-      actions: write
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     steps:
@@ -164,11 +163,6 @@ jobs:
       - name: Delete decrypted IPA and API credentials
         if: always()
         run: python3 Scripts/testflight/ci.py cleanup
-      - name: Dispatch 9.0.1 only for Apple upload limit
-        if: failure() && !cancelled() && steps.claim.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 Scripts/testflight/ci.py fallback
       - name: Distribution summary
         if: always()
         env:

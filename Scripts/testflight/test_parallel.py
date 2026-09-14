@@ -31,6 +31,20 @@ class ParallelTests(unittest.TestCase):
         self.assertEqual(self.add(state, '3.1')['build'], '23')
         self.assertEqual(len(state['reservations']), 3)
 
+    def test_versions_share_counter_and_preserve_their_metadata(self):
+        state = self.ledger()
+        for run, version, expected in (('1', '9.0.0', '21'), ('2', '9.0.1', '22'), ('3', '9.0.0', '23')):
+            configuration = {'app': 'fixture', 'group_id': '', 'group_name': '',
+                             'version': version, 'configured_testers': 1}
+            with patch.object(queue, 'VERSION', version):
+                row = queue.reserve(state, [], run + '.1', run, '1', 'a' * 40, configuration)
+            self.assertEqual(row['build'], expected)
+            self.assertEqual(row['version'], version)
+            self.assertEqual(row['metadata']['group_name'], f'{version} ({expected})')
+        with patch.object(queue, 'VERSION', '9.0.1'):
+            with self.assertRaises(ci.SafeError):
+                self.add(state, '1.1')
+
     def test_generated_group_names_are_reserved_atomically(self):
         state = self.ledger()
         configuration = {'app': 'fixture', 'group_id': '', 'group_name': '',
@@ -184,6 +198,42 @@ class ParallelTests(unittest.TestCase):
         with patch.dict(os.environ, {'TF_RECOVERY_CONFIRMED': 'false'}):
             with self.assertRaises(ci.SafeError):
                 queue.recover()
+
+    def test_upload_limit_dispatches_only_901_and_only_once(self):
+        for key in ('upload_error_codes', 'processing_error_codes'):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory, patch.object(ci, 'ROOT', Path(directory)):
+                state = self.ledger()
+                self.add(state, '1.1')
+                ci.save(**{key: '90034, 90382'})
+                api = queue.GitHub()
+                env = {'GITHUB_RUN_ID': '1', 'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_SHA': 'a' * 40, 'GITHUB_REF_NAME': 'main'}
+                with patch.dict(os.environ, env), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'change', side_effect=lambda f: f(state)), patch.object(api, 'request', return_value={}) as request:
+                    ci.fallback()
+                    ci.fallback()
+                request.assert_called_once_with('POST', '/actions/workflows/testflight-poc-9-0-1.yml/dispatches', {'ref': 'main', 'inputs': {'initialize_state': False}})
+                self.assertEqual(state['reservations'][0]['fallback']['status'], 'dispatch accepted')
+
+    def test_fallback_never_runs_for_901_or_unrelated_errors(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(ci, 'ROOT', Path(directory)), patch.object(queue, 'GitHub') as api:
+            for version, code in (('9.0.1', '90382'), ('9.0.0', '90034'), ('9.0.0', '')):
+                ci.save(upload_error_codes=code, processing_error_codes='')
+                with patch.object(ci, 'VERSION', version):
+                    ci.fallback()
+            api.assert_not_called()
+
+    def test_uncertain_fallback_dispatch_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(ci, 'ROOT', Path(directory)):
+            state = self.ledger()
+            self.add(state, '1.1')
+            ci.save(processing_error_codes='90382')
+            api = queue.GitHub()
+            env = {'GITHUB_RUN_ID': '1', 'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_SHA': 'a' * 40, 'GITHUB_REF_NAME': 'main'}
+            with patch.dict(os.environ, env), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'change', side_effect=lambda f: f(state)), patch.object(api, 'request', side_effect=ci.SafeError('connection uncertain')) as request:
+                with self.assertRaises(ci.SafeError):
+                    ci.fallback()
+                ci.fallback()
+            self.assertEqual(request.call_count, 1)
+            self.assertEqual(state['reservations'][0]['fallback']['status'], 'dispatch claimed')
 
     def test_encrypted_transfer_round_trip_tampering_and_revision_mismatch(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(ci, 'ROOT', Path(directory)), patch.dict(os.environ, {

@@ -9,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ci import SafeError, require, allocate, save
+from ci import SafeError, require, allocate, save, VERSION
 
 BRANCH = 'codex/testflight-state-integer-21'
 FILE = '.testflight/reservations.json'
@@ -106,17 +106,17 @@ def reserve(ledger, existing, reservation_id, run_id, attempt, sha, configuratio
     rows = ledger['reservations']
     for row in rows:
         if row['id'] == reservation_id:
-            if row['sha'] != sha:
+            if row['sha'] != sha or row['version'] != VERSION:
                 raise SafeError('Reservation source revision mismatch')
             return copy.deepcopy(row)
     build = allocate(existing, [row['build'] for row in rows])
-    row = {'id': reservation_id, 'build': build, 'version': '9.0.0', 'run_id': run_id,
+    row = {'id': reservation_id, 'build': build, 'version': VERSION, 'run_id': run_id,
            'attempt': attempt, 'sha': sha, 'status': 'building'}
     if configuration is not None:
         row['metadata'] = {**configuration, 'build': build, 'reservation_id': reservation_id,
                            'source_sha': sha, 'preparation': 'passed'}
     if configuration is not None and configuration.get('group_id') == '':
-        row['metadata']['group_name'] = f"9.0.0 ({build})"
+        row['metadata']['group_name'] = f"{VERSION} ({build})"
     rows.append(row)
     return copy.deepcopy(row)
 

@@ -26,9 +26,12 @@ class FakeAPI:
         self.builds = []
         self.calls = []
         self.groups = []
+        self.uploads = []
 
     def all(self, path, params=None):
         self.calls.append(('GET', path, params))
+        if path.endswith('/buildUploads'):
+            return self.uploads
         if path.endswith('/betaGroups'):
             return self.groups
         if path == '/v1/builds':
@@ -89,6 +92,24 @@ class SafetyTests(unittest.TestCase):
         with patch.object(ci, 'API', return_value=api), contextlib.redirect_stdout(io.StringIO()):
             ci.distribute()
 
+    def test_marketing_version_configuration_is_restricted(self):
+        for value in ('9.0.0', '9.0.1'):
+            with patch.dict(os.environ, {'TF_VERSION': value}):
+                self.assertEqual(ci.configured_version(), value)
+        with patch.dict(os.environ, {'TF_VERSION': 'invalid-sensitive-value'}):
+            with self.assertRaises(ci.SafeError) as caught:
+                ci.configured_version()
+            self.assertNotIn('invalid-sensitive-value', str(caught.exception))
+
+    def test_901_distribution_uses_901_group_and_processing_version(self):
+        api = FakeAPI(existing=True)
+        with patch.object(ci, 'VERSION', '9.0.1'):
+            self.distribute(api)
+        self.assertEqual(api.groups[0]['attributes']['name'], '9.0.1 (9000.1.1)')
+        queries = [params for method, path, params in api.calls if method == 'GET' and path == '/v1/builds']
+        self.assertEqual(queries[0]['filter[preReleaseVersion.version]'], '9.0.1')
+        self.assertEqual(ci.read_state()['testers_verified'], 1)
+
     def test_integer_build_numbers_increase_sequentially(self):
         self.assertEqual(ci.allocate([]), '21')
         reserved = []
@@ -113,7 +134,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_processing_failure_and_timeout(self):
         api = FakeAPI()
-        with patch.object(api, 'all', return_value=[{'id': 'fixture', 'attributes': {'processingState': 'INVALID'}}]):
+        with patch.object(api, 'all', side_effect=lambda path, params=None: [] if path.endswith('/buildUploads') else [{'id': 'fixture', 'attributes': {'processingState': 'INVALID'}}]):
             with self.assertRaises(ci.SafeError):
                 ci.wait_build(api, ci.read_state())
         self.assertEqual(ci.read_state()['processing'], 'INVALID')
@@ -124,7 +145,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_wrong_processed_build_is_rejected(self):
         api = FakeAPI()
-        with patch.object(api, 'all', return_value=[{'id': 'fixture', 'attributes': {'processingState': 'VALID', 'version': 'wrong'}}]):
+        with patch.object(api, 'all', side_effect=lambda path, params=None: [] if path.endswith('/buildUploads') else [{'id': 'fixture', 'attributes': {'processingState': 'VALID', 'version': 'wrong'}}]):
             with self.assertRaises(ci.SafeError):
                 ci.wait_build(api, ci.read_state())
 
@@ -155,6 +176,7 @@ class SafetyTests(unittest.TestCase):
         ci.summary()
         text = str(caught.exception) + (ci.ROOT / 'state.json').read_text() + (ci.ROOT / 'summary.md').read_text()
         self.assertIn('Apple error codes: 90161, 90382', text)
+        self.assertEqual(ci.read_state()['upload_error_codes'], '90161, 90382')
         for value in ('private-email', 'private-token', 'private-path', 'synthetic-key'):
             self.assertNotIn(value, text)
         self.assertIn('failed', ci.read_state()['upload'])
@@ -184,11 +206,71 @@ class SafetyTests(unittest.TestCase):
             ci.upload()
         self.assertNotIn('accepted', ci.read_state()['upload'])
 
+    def upload_fixture(self, status='FAILED', **overrides):
+        return {'id': 'upload-fixture', 'attributes': {
+            'cfBundleShortVersionString': ci.VERSION, 'cfBundleVersion': '9000.1.1',
+            'platform': 'IOS', 'state': {'state': status, 'errors': [
+                {'code': '90382', 'description': 'private-tester private-token'},
+                {'code': 'sensitive-code', 'description': 'private-data'}]}, **overrides}}
+
+    def test_processing_rejection_stops_before_build_lookup_or_sleep(self):
+        api = FakeAPI()
+        api.uploads = [self.upload_fixture()]
+        with patch.object(ci.time, 'sleep') as sleep:
+            with self.assertRaises(ci.SafeError) as caught:
+                ci.wait_build(api, ci.read_state())
+        self.assertIn('90382', str(caught.exception))
+        self.assertFalse(any(path == '/v1/builds' for _, path, _ in api.calls))
+        sleep.assert_not_called()
+        ci.summary()
+        text = str(caught.exception) + (ci.ROOT / 'state.json').read_text() + (ci.ROOT / 'summary.md').read_text()
+        self.assertNotIn('private-', text)
+        self.assertNotIn('sensitive-code', text)
+        self.assertEqual(ci.read_state()['upload_processing'], 'FAILED')
+
+    def test_complete_upload_still_requires_valid_build(self):
+        api = FakeAPI()
+        api.uploads = [self.upload_fixture('COMPLETE')]
+        self.assertEqual(ci.wait_build(api, ci.read_state()), 'build-fixture')
+        self.assertEqual(ci.read_state()['processing'], 'VALID')
+
+    def test_processing_upload_continues_polling(self):
+        api = FakeAPI()
+        api.uploads = [self.upload_fixture('PROCESSING')]
+        original = api.all
+        def lookup(path, params=None):
+            return [] if path == '/v1/builds' else original(path, params)
+        def reject(seconds):
+            api.uploads = [self.upload_fixture()]
+        with patch.object(api, 'all', side_effect=lookup), patch.object(ci.time, 'sleep', side_effect=reject) as sleep:
+            with self.assertRaises(ci.SafeError):
+                ci.wait_build(api, ci.read_state())
+        self.assertEqual(sleep.call_count, 1)
+
+    def test_upload_identity_and_ambiguity_fail_closed(self):
+        for overrides in ({'cfBundleShortVersionString': 'other'}, {'cfBundleVersion': '21'}, {'platform': 'MAC_OS'}, {'state': {'state': 'unknown'}}):
+            with self.subTest(overrides=overrides):
+                api = FakeAPI()
+                api.uploads = [self.upload_fixture(**overrides)]
+                with self.assertRaises(ci.SafeError):
+                    ci.wait_build(api, ci.read_state())
+        api.uploads = [self.upload_fixture(), self.upload_fixture()]
+        with self.assertRaises(ci.SafeError):
+            ci.wait_build(api, ci.read_state())
+
+    def test_upload_status_permission_failure_is_not_silently_ignored(self):
+        api = FakeAPI()
+        with patch.object(api, 'all', side_effect=ci.APIError('GET', 403)):
+            with self.assertRaises(ci.SafeError):
+                ci.wait_build(api, ci.read_state())
+        self.assertIn('lookup failed', ci.read_state()['upload_processing'])
+
     def test_processing_waits_until_valid(self):
         api = FakeAPI()
         results = [[], [{'id': 'fixture', 'attributes': {'processingState': 'PROCESSING'}}],
                    [{'id': 'fixture', 'attributes': {'processingState': 'VALID', 'version': '9000.1.1'}}]]
-        with patch.object(api, 'all', side_effect=results), patch.object(ci.time, 'sleep') as sleep:
+        sequence = iter(results)
+        with patch.object(api, 'all', side_effect=lambda path, params=None: [] if path.endswith('/buildUploads') else next(sequence)), patch.object(ci.time, 'sleep') as sleep:
             self.assertEqual(ci.wait_build(api, ci.read_state()), 'fixture')
             self.assertEqual(sleep.call_count, 2)
 
