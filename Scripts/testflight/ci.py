@@ -41,12 +41,24 @@ def require(name):
     return value
 
 
-def run(args, *, data=None, timeout=120, combined=False):
+def apple_error_codes(output):
+    # Only numeric codes with Apple's explicit error markers are reportable.
+    # Never return messages, URLs, identifiers, or arbitrary numbers.
+    patterns = (rb'\bITMS-([0-9]{5})\b',
+                rb'\bERROR\s*:\s*([0-9]{5})(?![0-9])',
+                rb'\bERROR[^\r\n]*?\(([0-9]{5})\)(?=\s|$)')
+    return sorted({code.decode('ascii') for pattern in patterns
+                   for code in re.findall(pattern, output, re.IGNORECASE)})[:10]
+
+
+def run(args, *, data=None, timeout=120, combined=False, report_apple_codes=False):
     # Do not echo commands, stdout or stderr: tools may include secrets or PII.
     result = subprocess.run(args, input=data, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, timeout=timeout, check=False)
     if result.returncode:
-        raise SafeError(f'{Path(args[0]).name} failed (exit {result.returncode}); raw output suppressed')
+        codes = apple_error_codes(result.stdout + b'\n' + result.stderr) if report_apple_codes else []
+        detail = '; Apple error codes: ' + ', '.join(codes) if codes else ''
+        raise SafeError(f'{Path(args[0]).name} failed (exit {result.returncode}){detail}; raw output suppressed')
     return result.stdout + result.stderr if combined else result.stdout
 
 
@@ -389,8 +401,16 @@ def upload():
     keydir.mkdir(mode=0o700, exist_ok=True)
     shutil.copyfile(ROOT / 'AuthKey.p8', keydir / f'AuthKey_{require("ASC_KEY_ID")}.p8')
     os.environ['API_PRIVATE_KEYS_DIR'] = str(keydir)
-    result = run(['xcrun', 'altool', '--upload-package', read_state()['ipa'],
-         '--api-key', require('ASC_KEY_ID'), '--api-issuer', require('ASC_ISSUER_ID')], timeout=1800, combined=True)
+    try:
+        result = run(['xcrun', 'altool', '--upload-package', read_state()['ipa'],
+             '--api-key', require('ASC_KEY_ID'), '--api-issuer', require('ASC_ISSUER_ID')],
+             timeout=1800, combined=True, report_apple_codes=True)
+    except SafeError as error:
+        save(upload='failed; ' + str(error))
+        raise
+    except subprocess.TimeoutExpired:
+        save(upload='timed out; Apple may have received the build')
+        raise SafeError('Upload timed out; reconcile Apple state; raw output suppressed') from None
     if b'UPLOAD SUCCEEDED' not in result and b'No errors uploading' not in result:
         save(upload='tool exited successfully; awaiting Apple build confirmation')
     else:

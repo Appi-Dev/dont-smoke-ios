@@ -136,6 +136,47 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(ci.read_state()['invitations_requested'], 0)
         self.assertEqual(ci.read_state()['testers_added'], 0)
 
+    def test_only_explicit_apple_error_codes_are_extracted(self):
+        output = (b'ERROR ITMS-90382: private message\nERROR: 90034 private text\n'
+                  b'ERROR: private upload failed (90161)\nITMS-90382\n'
+                  b'email=12345@example.invalid build=90001 token=54321\n'
+                  b'ITMS-123456 ERROR: 987654')
+        self.assertEqual(ci.apple_error_codes(output), ['90034', '90161', '90382'])
+        self.assertEqual(ci.apple_error_codes(b'private text 90382'), [])
+
+    def test_upload_failure_reports_codes_and_keeps_payload_private(self):
+        ci.save(ipa='fixture.ipa')
+        (ci.ROOT / 'AuthKey.p8').write_text('synthetic-key')
+        result = subprocess.CompletedProcess([], 1, b'ERROR ITMS-90382: private-email private-token',
+                                             b'ERROR: private-path (90161)')
+        with patch.dict(os.environ, {'ASC_KEY_ID': 'FIXTURE', 'ASC_ISSUER_ID': 'fixture'}), patch.object(ci.subprocess, 'run', return_value=result):
+            with self.assertRaises(ci.SafeError) as caught:
+                ci.upload()
+        ci.summary()
+        text = str(caught.exception) + (ci.ROOT / 'state.json').read_text() + (ci.ROOT / 'summary.md').read_text()
+        self.assertIn('Apple error codes: 90161, 90382', text)
+        for value in ('private-email', 'private-token', 'private-path', 'synthetic-key'):
+            self.assertNotIn(value, text)
+        self.assertIn('failed', ci.read_state()['upload'])
+
+    def test_unrecognized_tool_error_stays_suppressed(self):
+        result = subprocess.CompletedProcess([], 1, b'private data 90382', b'private stderr')
+        with patch.object(ci.subprocess, 'run', return_value=result):
+            with self.assertRaises(ci.SafeError) as caught:
+                ci.run(['xcrun'], report_apple_codes=True)
+        self.assertNotIn('90382', str(caught.exception))
+        self.assertNotIn('private', str(caught.exception))
+
+    def test_upload_timeout_does_not_expose_captured_output(self):
+        ci.save(ipa='fixture.ipa')
+        (ci.ROOT / 'AuthKey.p8').write_text('synthetic-key')
+        error = subprocess.TimeoutExpired(['private-command'], 1800, output=b'private-output', stderr=b'private-stderr')
+        with patch.dict(os.environ, {'ASC_KEY_ID': 'FIXTURE', 'ASC_ISSUER_ID': 'fixture'}), patch.object(ci.subprocess, 'run', side_effect=error):
+            with self.assertRaises(ci.SafeError) as caught:
+                ci.upload()
+        self.assertNotIn('private-', str(caught.exception) + (ci.ROOT / 'state.json').read_text())
+        self.assertIn('may have received', ci.read_state()['upload'])
+
     def test_unconfirmed_upload_is_not_reported_as_accepted(self):
         ci.save(ipa='fixture.ipa')
         (ci.ROOT / 'AuthKey.p8').write_text('synthetic-key')
