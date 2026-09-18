@@ -239,8 +239,6 @@ def prepare():
                          'version': VERSION, 'configured_testers': len(rows)}
         reservation = github.change(lambda ledger: reserve(ledger, existing, identity(),
             require('GITHUB_RUN_ID'), require('GITHUB_RUN_ATTEMPT'), require('GITHUB_SHA'), configuration))
-        if reservation['status'] != 'building':
-            raise SafeError('This attempt already has a reservation; rerun all jobs with a new attempt')
         build = reservation['build']
         save(reservation_id=reservation['id'], source_sha=reservation['sha'])
     else:
@@ -251,9 +249,9 @@ def prepare():
 
 
 def reserved_metadata():
-    from reservations import GitHub, identity
+    from reservations import GitHub, current_record
     ledger, _ = GitHub().load()
-    row = next((r for r in ledger['reservations'] if r['id'] == identity()), None)
+    row = current_record(ledger)
     if not row or not isinstance(row.get('metadata'), dict):
         raise SafeError('Reserved metadata is missing; dispatch a new run with the updated workflow')
     metadata = row['metadata']
@@ -262,7 +260,7 @@ def reserved_metadata():
     if set(metadata) != fields:
         raise SafeError('Reserved metadata has an unexpected schema')
     if (metadata['version'], metadata['source_sha'], metadata['reservation_id'], metadata['build']) != (
-            VERSION, require('GITHUB_SHA'), identity(), row['build']):
+            VERSION, require('GITHUB_SHA'), row['id'], row['build']):
         raise SafeError('Reserved metadata revision, version, attempt or build mismatch')
     return metadata
 
@@ -271,6 +269,64 @@ def initialise_build():
     metadata = reserved_metadata()
     save(**metadata)
 
+
+
+def initialise_submit():
+    from reservations import GitHub, current_record
+    initialise_build()
+    ledger, _ = GitHub().load()
+    row = current_record(ledger)
+    attempt = row.get('artifact_attempt', row['attempt'])
+    if not str(attempt).isdigit():
+        raise SafeError('Invalid artifact attempt')
+    with open(require('GITHUB_OUTPUT'), 'a') as output:
+        output.write(f"artifact_name=testflight-ipa-{require('GITHUB_RUN_ID')}-{attempt}\n")
+
+
+def claim_submission():
+    from reservations import GitHub, current_record
+    api, github, state = API(), GitHub(), read_state()
+    ledger, _ = github.load()
+    row = current_record(ledger)
+    builds = api.all('/v1/builds', {'filter[app]': state['app'], 'filter[version]': state['build'],
+                     'filter[preReleaseVersion.version]': VERSION})
+    uploads = api.all(f"/v1/apps/{state['app']}/buildUploads", {
+        'filter[cfBundleShortVersionString]': VERSION, 'filter[cfBundleVersion]': state['build'],
+        'filter[platform]': 'IOS', 'limit': 200})
+    for item in uploads:
+        attrs = item['attributes']
+        if (attrs.get('cfBundleShortVersionString'), attrs.get('cfBundleVersion'), attrs.get('platform')) != (VERSION, state['build'], 'IOS'):
+            raise SafeError('Retry upload identity mismatch')
+    if len(builds) > 1:
+        raise SafeError('Ambiguous build retry lookup')
+    resume = bool(builds) or any(u['attributes'].get('state', {}).get('state') in ('PROCESSING', 'COMPLETE') for u in uploads)
+    failed = bool(uploads) and all(u['attributes'].get('state', {}).get('state') == 'FAILED' for u in uploads)
+    if not resume and row.get('ever_uploaded', row['status'] in ('uploading', 'blocked', 'completed')) and not (failed or row.get('upload_rejected')):
+        raise SafeError('Previous upload is uncertain; reconcile Apple state before retrying this build')
+    attempt = require('GITHUB_RUN_ATTEMPT')
+    def claim(ledger):
+        actual = current_record(ledger)
+        if int(actual.get('submission_attempt', '0')) >= int(attempt):
+            raise SafeError('Submission already claimed for this attempt')
+        actual.update(status='uploading', ever_uploaded=True, submission_attempt=attempt, upload_rejected=False)
+    github.change(claim)
+    save(upload_mode='resume' if resume else 'upload',
+         ignored_upload_ids=[u['id'] for u in uploads] if not resume else [],
+         reservation_status='uploading')
+
+
+def finish_submission():
+    from reservations import GitHub, current_record
+    state = read_state()
+    succeeded = os.environ.get('TF_DISTRIBUTE_OUTCOME') == 'success'
+    def finish(ledger):
+        row = current_record(ledger)
+        if row.get('submission_attempt') != require('GITHUB_RUN_ATTEMPT'):
+            raise SafeError('Submission completion attempt mismatch')
+        row['status'] = 'completed' if succeeded else 'blocked'
+        row['upload_rejected'] = state.get('upload_processing') == 'FAILED' or '90382' in state.get('upload_error_codes', '').split(', ')
+        return row['status']
+    save(reservation_status=GitHub().change(finish))
 
 
 def package():
@@ -411,6 +467,9 @@ def build():
 
 
 def upload():
+    if read_state().get('upload_mode') == 'resume':
+        save(upload='existing Apple upload found; resuming without re-upload')
+        return
     save(upload='started')
     keydir = ROOT / 'private_keys'
     keydir.mkdir(mode=0o700, exist_ok=True)
@@ -441,6 +500,11 @@ def check_build_upload(api, state):
     except SafeError:
         save(upload_processing='status lookup failed; details suppressed')
         raise
+    uploads = [u for u in uploads if u['id'] not in state.get('ignored_upload_ids', []) or
+               u.get('attributes', {}).get('state', {}).get('state') != 'FAILED']
+    active = [u for u in uploads if u.get('attributes', {}).get('state', {}).get('state') in ('AWAITING_UPLOAD', 'PROCESSING', 'COMPLETE')]
+    if active:
+        uploads = active
     if len(uploads) > 1:
         raise SafeError('Build upload lookup is ambiguous; reconcile Apple state')
     if not uploads:
@@ -588,8 +652,9 @@ def distribute():
     elif external not in ('WAITING_FOR_BETA_REVIEW', 'IN_BETA_REVIEW', 'BETA_APPROVED', 'READY_FOR_BETA_TESTING'):
         raise SafeError('Unknown external testing state; check App Store Connect')
     save(beta_review=external)
-    api.request('POST', f'/v1/betaGroups/{group_id}/relationships/builds',
-                {'data': [linkage('builds', build_id)]})
+    if not any(b['id'] == build_id for b in api.all(f'/v1/betaGroups/{group_id}/builds')):
+        api.request('POST', f'/v1/betaGroups/{group_id}/relationships/builds',
+                    {'data': [linkage('builds', build_id)]})
     linked = api.all(f'/v1/betaGroups/{group_id}/builds')
     if not any(b['id'] == build_id for b in linked):
         raise SafeError('Group build assignment was not confirmed')
@@ -691,7 +756,8 @@ def fallback():
     from reservations import GitHub, identity
     api = GitHub()
     def claim(ledger):
-        row = next((r for r in ledger['reservations'] if r['id'] == identity()), None)
+        from reservations import current_record
+        row = current_record(ledger)
         if not row or row['version'] != '9.0.0' or row['sha'] != require('GITHUB_SHA'):
             raise SafeError('Fallback reservation identity mismatch')
         if row.get('fallback'):
@@ -709,7 +775,8 @@ def fallback():
         save(fallback='9.0.1 dispatch failed or uncertain; check Actions before manual retry')
         raise SafeError('Fallback dispatch failed or uncertain; not automatically retried') from None
     def confirm(ledger):
-        row = next(r for r in ledger['reservations'] if r['id'] == identity())
+        from reservations import current_record
+        row = current_record(ledger)
         row['fallback']['status'] = 'dispatch accepted'
     api.change(confirm)
     save(fallback='9.0.1 workflow dispatch accepted; see repository Actions runs')
@@ -721,7 +788,7 @@ def summary():
     rows = [('Job', os.environ.get('TF_JOB_STATUS', 'unknown')),
             ('Marketing version', VERSION), ('Build number', state.get('build', 'not assigned'))]
     for label, key in [('Reservation', 'reservation_id'), ('Reservation status', 'reservation_status'), ('Reservation recovery', 'recovery'), ('IPA transfer', 'transfer'), ('Preflight', 'preparation'), ('Archive', 'archive'), ('IPA export', 'export'),
-                       ('Upload', 'upload'), ('Build Uploads processing', 'upload_processing'),
+                       ('Upload', 'upload'), ('Retry action', 'upload_mode'), ('Build Uploads processing', 'upload_processing'),
                        ('Processing error codes', 'processing_error_codes'), ('Apple processing', 'processing'), ('External group', 'group_name'), ('Group creation', 'group_creation'),
                        ('Group assignment', 'group'), ('Beta App Review', 'beta_review'),
                        ('Distribution', 'distribution'), ('9.0.1 fallback', 'fallback'), ('Invitations', 'invitations'),
@@ -767,7 +834,7 @@ def cleanup():
 
 if __name__ == '__main__':
     os.umask(0o077)
-    commands = {f.__name__: f for f in (prepare, initialise_build, build, package, restore, upload, distribute, fallback, summary, cleanup)}
+    commands = {f.__name__: f for f in (prepare, initialise_build, initialise_submit, claim_submission, finish_submission, build, package, restore, upload, distribute, fallback, summary, cleanup)}
     try:
         commands[sys.argv[1]]()
     except Exception as error:

@@ -102,10 +102,22 @@ def identity():
     return require('GITHUB_RUN_ID') + '.' + require('GITHUB_RUN_ATTEMPT')
 
 
+def current_record(ledger):
+    rows = [r for r in ledger['reservations'] if r['run_id'] == require('GITHUB_RUN_ID')]
+    if len(rows) != 1:
+        raise SafeError('Expected one reservation for this run; older multi-reservation runs require reconciliation')
+    row = rows[0]
+    if row['sha'] != require('GITHUB_SHA') or row['version'] != VERSION:
+        raise SafeError('Reservation revision or version mismatch')
+    return row
+
+
 def reserve(ledger, existing, reservation_id, run_id, attempt, sha, configuration=None):
     rows = ledger['reservations']
+    if sum(row['run_id'] == run_id for row in rows) > 1:
+        raise SafeError('Older run has multiple reservations; reconcile before retrying')
     for row in rows:
-        if row['id'] == reservation_id:
+        if row['run_id'] == run_id:
             if row['sha'] != sha or row['version'] != VERSION:
                 raise SafeError('Reservation source revision mismatch')
             return copy.deepcopy(row)
@@ -139,7 +151,16 @@ def transition(ledger, reservation_id, status):
 
 
 def update(status):
-    row = GitHub().change(lambda ledger: transition(ledger, identity(), status))
+    def apply(ledger):
+        current = current_record(ledger)
+        if status == 'ready':
+            current['artifact_attempt'] = require('GITHUB_RUN_ATTEMPT')
+        if (current.get('ever_uploaded') or current['status'] in ('uploading', 'blocked', 'completed') or current.get('recovered_by_run')) and status in ('ready', 'skipped'):
+            return copy.deepcopy(current)
+        if status == 'ready' and current['status'] == 'skipped':
+            current['status'] = 'building'
+        return transition(ledger, current['id'], status)
+    row = GitHub().change(apply)
     save(reservation_status=row['status'], build=row['build'], reservation_id=row['id'])
     return row
 
@@ -155,7 +176,7 @@ def recover():
         row = next((r for r in ledger['reservations'] if r['id'] == identifier), None)
         if not row or row['status'] not in ('uploading', 'blocked'):
             raise SafeError('Recovery is limited to an uncertain upload reservation')
-        attempt = GitHub().request('GET', f'/actions/runs/{row["run_id"]}/attempts/{row["attempt"]}')
+        attempt = GitHub().request('GET', f'/actions/runs/{row["run_id"]}')
         if attempt['status'] != 'completed':
             raise SafeError('Finish or cancel the originating workflow before recovery')
         row['status'] = resolution

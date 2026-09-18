@@ -45,6 +45,67 @@ class ParallelTests(unittest.TestCase):
             with self.assertRaises(ci.SafeError):
                 self.add(state, '1.1')
 
+    def test_failed_job_retry_loads_prior_metadata_and_artifact(self):
+        state = self.ledger()
+        config = {'app': 'fixture', 'group_id': '', 'group_name': '', 'version': ci.VERSION, 'configured_testers': 1}
+        queue.reserve(state, [], '1.1', '1', '1', 'a' * 40, config)
+        state['reservations'][0]['artifact_attempt'] = '1'
+        api = queue.GitHub()
+        with tempfile.TemporaryDirectory() as directory, patch.object(ci, 'ROOT', Path(directory)), patch.dict(os.environ, {
+            'GITHUB_RUN_ID': '1', 'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_SHA': 'a' * 40,
+            'GITHUB_OUTPUT': str(Path(directory) / 'output')}), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'load', return_value=(state, 'sha')):
+            ci.initialise_submit()
+            self.assertEqual(ci.read_state()['build'], '21')
+            self.assertIn('testflight-ipa-1-1', (Path(directory) / 'output').read_text())
+
+    def test_failed_build_retry_marks_same_reservation_ready(self):
+        state = self.ledger()
+        self.add(state, '1.1')
+        queue.transition(state, '1.1', 'skipped')
+        api = queue.GitHub()
+        with patch.dict(os.environ, {'GITHUB_RUN_ID': '1', 'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_SHA': 'a' * 40}), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'change', side_effect=lambda f: f(state)), patch.object(queue, 'save'):
+            self.assertEqual(queue.update('ready')['build'], '21')
+        self.assertEqual(state['reservations'][0]['artifact_attempt'], '2')
+        self.assertEqual(len(state['reservations']), 1)
+
+    def test_submission_retry_modes_and_uncertainty(self):
+        for status, mode in (('fresh', 'upload'), ('FAILED', 'upload'), ('PROCESSING', 'resume'), ('COMPLETE', 'resume'), ('uncertain', None)):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory, patch.object(ci, 'ROOT', Path(directory)):
+                state = self.ledger()
+                self.add(state, '1.1')
+                state['reservations'][0].update(status='blocked', ever_uploaded=status != 'fresh', submission_attempt='1')
+                ci.save(app='fixture', build='21')
+                github = queue.GitHub()
+                class Apple:
+                    def all(self, path, params=None):
+                        if path == '/v1/builds' or status in ('fresh', 'uncertain'):
+                            return []
+                        return [{'id': 'upload-fixture', 'attributes': {'cfBundleShortVersionString': ci.VERSION,
+                                 'cfBundleVersion': '21', 'platform': 'IOS', 'state': {'state': status}}}]
+                with patch.dict(os.environ, {'GITHUB_RUN_ID': '1', 'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_SHA': 'a' * 40}), patch.object(queue, 'GitHub', return_value=github), patch.object(github, 'load', return_value=(state, 'sha')), patch.object(github, 'change', side_effect=lambda f: f(state)), patch.object(ci, 'API', return_value=Apple()):
+                    if mode is None:
+                        with self.assertRaises(ci.SafeError):
+                            ci.claim_submission()
+                        self.assertEqual(state['reservations'][0]['submission_attempt'], '1')
+                    else:
+                        ci.claim_submission()
+                        self.assertEqual(ci.read_state()['upload_mode'], mode)
+                        with self.assertRaises(ci.SafeError):
+                            ci.claim_submission()
+
+    def test_retry_completion_persists_failed_processing_evidence(self):
+        state = self.ledger()
+        self.add(state, '1.1')
+        state['reservations'][0].update(status='uploading', ever_uploaded=True, submission_attempt='2')
+        api = queue.GitHub()
+        with tempfile.TemporaryDirectory() as directory, patch.object(ci, 'ROOT', Path(directory)), patch.dict(os.environ, {
+            'GITHUB_RUN_ID': '1', 'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_SHA': 'a' * 40,
+            'TF_DISTRIBUTE_OUTCOME': 'failure'}), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'change', side_effect=lambda f: f(state)):
+            ci.save(upload_processing='FAILED')
+            ci.finish_submission()
+            self.assertTrue(state['reservations'][0]['upload_rejected'])
+            self.assertEqual(state['reservations'][0]['status'], 'blocked')
+
     def test_generated_group_names_are_reserved_atomically(self):
         state = self.ledger()
         configuration = {'app': 'fixture', 'group_id': '', 'group_name': '',
@@ -71,7 +132,7 @@ class ParallelTests(unittest.TestCase):
         state = self.ledger()
         self.add(state, '1.1')
         api = queue.GitHub()
-        with patch.dict(os.environ, {'GITHUB_RUN_ID': '1', 'GITHUB_RUN_ATTEMPT': '1'}), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'load', return_value=(state, 'sha')):
+        with patch.dict(os.environ, {'GITHUB_RUN_ID': '1', 'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_SHA': 'a' * 40}), patch.object(queue, 'GitHub', return_value=api), patch.object(api, 'load', return_value=(state, 'sha')):
             with self.assertRaises(ci.SafeError) as caught:
                 ci.reserved_metadata()
             self.assertIn('dispatch a new run', str(caught.exception))
@@ -86,12 +147,14 @@ class ParallelTests(unittest.TestCase):
             with self.assertRaises(ci.SafeError):
                 ci.reserved_metadata()
 
-    def test_retry_does_not_duplicate_but_new_attempt_reserves_new_number(self):
+    def test_retry_attempt_reuses_original_number(self):
         state = self.ledger()
         first = self.add(state, '1.1')
         self.assertEqual(self.add(state, '1.1'), first)
         self.assertEqual(len(state['reservations']), 1)
-        self.assertEqual(self.add(state, '1.2')['build'], '22')
+        self.assertEqual(self.add(state, '1.2')['build'], '21')
+        self.assertEqual(len(state['reservations']), 1)
+        self.assertEqual(self.add(state, '2.1')['build'], '22')
 
     def test_requested_integer_sequence_is_independent_of_dotted_uploads(self):
         state = self.ledger()

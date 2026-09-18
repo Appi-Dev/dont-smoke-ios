@@ -199,6 +199,20 @@ class SafetyTests(unittest.TestCase):
         self.assertNotIn('private-', str(caught.exception) + (ci.ROOT / 'state.json').read_text())
         self.assertIn('may have received', ci.read_state()['upload'])
 
+    def test_resume_does_not_invoke_upload_tool(self):
+        ci.save(upload_mode='resume')
+        with patch.object(ci, 'run') as runner:
+            ci.upload()
+        runner.assert_not_called()
+        self.assertIn('without re-upload', ci.read_state()['upload'])
+
+    def test_prior_failed_upload_is_ignored_while_retry_appears(self):
+        api = FakeAPI()
+        api.uploads = [self.upload_fixture()]
+        state = {**ci.read_state(), 'ignored_upload_ids': ['upload-fixture']}
+        ci.check_build_upload(api, state)
+        self.assertEqual(ci.read_state()['upload_processing'], 'not yet visible')
+
     def test_unconfirmed_upload_is_not_reported_as_accepted(self):
         ci.save(ipa='fixture.ipa')
         (ci.ROOT / 'AuthKey.p8').write_text('synthetic-key')
